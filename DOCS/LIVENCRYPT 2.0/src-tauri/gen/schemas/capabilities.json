@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"Capability for the main window and tool windows","local":true,"windows":["main","text-cipher","file-cipher","template-editor"],"permissions":["core:default","core:window:default","core:window:allow-create","core:window:allow-set-focus","opener:default","dialog:default","dialog:allow-open","dialog:allow-save"]}}
