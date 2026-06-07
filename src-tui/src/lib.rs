@@ -39,6 +39,12 @@ pub fn initialize_core() {
         eprintln!("[SECURITY] {}", warning);
     }
 
+    if crate::security::seccomp::seccomp_requested() {
+        if let Err(error) = crate::security::seccomp::apply_syscall_denylist() {
+            eprintln!("[SECURITY] seccomp no aplicado: {}", error);
+        }
+    }
+
     crate::crypto::file_cipher::configure_chunk_tasks();
     if let Err(error) = crate::templates::initialize_defaults() {
         eprintln!("[INIT] Error inicializando plantillas: {}", error);
@@ -129,6 +135,14 @@ pub fn decipher_text(
         password_direction,
         control_symbols,
     ))
+}
+
+pub fn cipher_text_secure(plaintext: &str, secret: &str) -> Result<String, String> {
+    crate::crypto::secure_text::encrypt_text(plaintext, secret)
+}
+
+pub fn decipher_text_secure(token: &str, secret: &str) -> Result<String, String> {
+    crate::crypto::secure_text::decrypt_text(token, secret)
 }
 
 pub fn load_file_info(path: &Path) -> Result<FileInfo, String> {

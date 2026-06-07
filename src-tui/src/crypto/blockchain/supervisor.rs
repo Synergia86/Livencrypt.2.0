@@ -31,6 +31,14 @@ impl GatewaySupervisor {
     }
 
     pub fn run_loop_iteration(&mut self, request: ExtensionRequest) -> Result<Vec<u8>, String> {
+        // Monitor de riesgo del entorno: un score crítico (binario manipulado,
+        // LD_PRELOAD, etc.) dispara el aislamiento permanente del llavero.
+        if crate::security::ai_monitor::current_risk_score()
+            >= crate::security::ai_monitor::CRITICAL_RISK_THRESHOLD
+        {
+            self.breaker.trigger_hard_lock();
+        }
+
         if self.breaker.state == GatewaySecurityState::HardLocked {
             let response = ExtensionResponse::<()>::Error(
                 "acceso revocado: intervencion local requerida".to_string(),
@@ -83,6 +91,18 @@ impl GatewaySupervisor {
                     ));
                     return serde_json::to_vec(&response).map_err(|error| error.to_string());
                 }
+
+                if let Err(target_error) = self.firewall.validate_target_destination_id(
+                    &parsed,
+                    sign_request.target_dex_cex_id.as_deref(),
+                ) {
+                    self.register_integrity_failure(&target_error, now);
+                    let response = ExtensionResponse::<()>::Error(format!(
+                        "violacion de perimetro: {}",
+                        target_error
+                    ));
+                    return serde_json::to_vec(&response).map_err(|error| error.to_string());
+                }
                 let effective_volume = match self.firewall.effective_volume_units(&parsed) {
                     Ok(volume) => volume,
                     Err(error) => {
@@ -93,12 +113,34 @@ impl GatewaySupervisor {
                 };
 
                 // Firmar primero para no desperdiciar contadores si la firma falla.
-                let signature_response = match self.keymaster.sign_transaction(
-                    &sign_request.chain,
-                    sign_request.account_index,
-                    sign_request.address_index,
-                    &sign_request.raw_tx_payload,
-                ) {
+                // Si el sandbox de firma está activo, la clave solo se usa dentro de un
+                // proceso hijo aislado por namespaces (sin red), y solo regresa la firma.
+                let signature_result = if crate::security::sign_sandbox::sign_sandbox_requested() {
+                    let keymaster = &self.keymaster;
+                    let chain = sign_request.chain.clone();
+                    let account = sign_request.account_index;
+                    let index = sign_request.address_index;
+                    let payload = sign_request.raw_tx_payload.clone();
+                    crate::security::sign_sandbox::run_isolated(move || {
+                        let signature =
+                            keymaster.sign_transaction(&chain, account, index, &payload)?;
+                        serde_json::to_vec(&signature).map_err(|error| error.to_string())
+                    })
+                    .and_then(|bytes| {
+                        serde_json::from_slice::<crate::crypto::blockchain::types::SignatureResponse>(
+                            &bytes,
+                        )
+                        .map_err(|error| error.to_string())
+                    })
+                } else {
+                    self.keymaster.sign_transaction(
+                        &sign_request.chain,
+                        sign_request.account_index,
+                        sign_request.address_index,
+                        &sign_request.raw_tx_payload,
+                    )
+                };
+                let signature_response = match signature_result {
                     Ok(signature) => signature,
                     Err(error) => {
                         let response = ExtensionResponse::<()>::Error(error);

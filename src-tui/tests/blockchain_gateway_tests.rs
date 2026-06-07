@@ -46,7 +46,7 @@ fn sign_transaction_allowed_only_after_parsing_real_destination() {
             address_index: 0,
             raw_tx_payload: ethereum_legacy_payload(0x11),
             value_usd: Decimal::from(999_999),
-            target_dex_cex_id: Some("campo-externo-ignorado".to_string()),
+            target_dex_cex_id: Some(format!("0x{}", hex::encode([0x11; 20]))),
         }))
         .expect("response");
 

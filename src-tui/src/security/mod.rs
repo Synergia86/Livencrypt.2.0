@@ -5,6 +5,7 @@
 pub mod ai_monitor;
 pub mod apparmor;
 pub mod audit;
+pub mod boot_shield;
 pub mod forensics;
 pub mod install_profile;
 pub mod loader;
@@ -12,6 +13,8 @@ pub mod network_profile;
 pub mod process_hardening;
 pub mod recovery;
 pub mod sandbox;
+pub mod seccomp;
+pub mod sign_sandbox;
 pub mod updates;
 pub mod vault;
 

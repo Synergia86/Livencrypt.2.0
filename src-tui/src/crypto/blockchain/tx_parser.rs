@@ -4,7 +4,6 @@
 
 use crate::crypto::blockchain::types::{ChainType, TxMethod};
 use rust_decimal::Decimal;
-use serde::Deserialize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ParsedDestinationKind {
@@ -38,7 +37,7 @@ pub fn parse_tx_payload(chain: &ChainType, raw_tx_payload: &[u8]) -> Result<Pars
     match chain {
         ChainType::Ethereum => parse_ethereum_payload(raw_tx_payload),
         ChainType::Bitcoin => parse_bitcoin_payload(raw_tx_payload),
-        ChainType::Solana => parse_solana_gateway_payload(raw_tx_payload),
+        ChainType::Solana => parse_solana_payload(raw_tx_payload),
         ChainType::Monero => Err("Monero requiere parser forense especifico no integrado".into()),
     }
 }
@@ -237,44 +236,102 @@ fn parse_bitcoin_payload(raw: &[u8]) -> Result<ParsedTx, String> {
     })
 }
 
-fn parse_solana_gateway_payload(raw: &[u8]) -> Result<ParsedTx, String> {
-    #[derive(Deserialize)]
-    struct SolanaPayload {
-        to_address: String,
-        lamports: u64,
-        method: Option<String>,
+fn parse_solana_payload(raw: &[u8]) -> Result<ParsedTx, String> {
+    // Decodifica un mensaje de transaccion Solana serializado (legacy o v0) y extrae
+    // una unica instruccion de transferencia nativa del System Program. Los bytes del
+    // mensaje son exactamente los que firma ed25519, igual que el binario en BTC/ETH.
+    const SYSTEM_TRANSFER_DISCRIMINANT: [u8; 4] = [2, 0, 0, 0];
+    const SOLANA_LAMPORTS_LIMIT: u64 = 100_000_000_000_000;
+
+    let first = *raw.first().ok_or_else(|| "mensaje Solana vacio".to_string())?;
+    let mut reader = ByteReader::new(raw);
+
+    if first & 0x80 != 0 {
+        let version = first & 0x7f;
+        if version != 0 {
+            return Err(format!(
+                "version de mensaje Solana no soportada: {}",
+                version
+            ));
+        }
+        reader.take(1)?;
     }
 
-    let payload: SolanaPayload = serde_json::from_slice(raw)
-        .map_err(|error| format!("payload Solana no es JSON de pasarela: {}", error))?;
-    if payload.to_address.trim().is_empty() {
-        return Err("Solana sin destino".into());
+    reader.take(3)?; // cabecera: firmas requeridas y cuentas de solo lectura
+
+    let account_count = reader.read_compact_u16()? as usize;
+    if account_count == 0 || account_count > 256 {
+        return Err("numero de cuentas Solana invalido".into());
     }
-    if payload.lamports > 100_000_000_000_000u64 {
+    let mut accounts = Vec::with_capacity(account_count);
+    for _ in 0..account_count {
+        let mut key = [0u8; 32];
+        key.copy_from_slice(reader.take(32)?);
+        accounts.push(key);
+    }
+
+    reader.take(32)?; // blockhash reciente
+
+    let instruction_count = reader.read_compact_u16()? as usize;
+    if instruction_count == 0 || instruction_count > 64 {
+        return Err("numero de instrucciones Solana invalido".into());
+    }
+
+    let system_program = [0u8; 32];
+    let mut transfer: Option<(usize, u64)> = None;
+    for _ in 0..instruction_count {
+        let program_id_index = reader.take(1)?[0] as usize;
+        let account_index_count = reader.read_compact_u16()? as u64;
+        let account_indexes = reader.take_usize(account_index_count)?.to_vec();
+        let data_len = reader.read_compact_u16()? as u64;
+        let data = reader.take_usize(data_len)?;
+
+        let program_id = accounts
+            .get(program_id_index)
+            .ok_or_else(|| "indice de programa Solana fuera de rango".to_string())?;
+        if *program_id != system_program {
+            return Err(
+                "instruccion Solana no soportada: solo transferencias del System Program".into(),
+            );
+        }
+        if data.len() != 12 || data[0..4] != SYSTEM_TRANSFER_DISCRIMINANT {
+            return Err("instruccion System Program no soportada (solo Transfer)".into());
+        }
+        if account_indexes.len() != 2 {
+            return Err("transferencia Solana debe referenciar exactamente 2 cuentas".into());
+        }
+        if transfer.is_some() {
+            return Err("solo se admite una transferencia Solana por mensaje".into());
+        }
+        let mut lamports_bytes = [0u8; 8];
+        lamports_bytes.copy_from_slice(&data[4..12]);
+        transfer = Some((account_indexes[1] as usize, u64::from_le_bytes(lamports_bytes)));
+    }
+
+    let (to_index, lamports) =
+        transfer.ok_or_else(|| "mensaje Solana sin transferencia".to_string())?;
+    if lamports > SOLANA_LAMPORTS_LIMIT {
         return Err("Solana lamports excesivos (limite 10^14)".into());
     }
-    let method_str = payload.method.as_deref().unwrap_or("transfer");
-    let method = if method_str == "transfer" {
-        TxMethod::SolanaTransfer
-    } else {
-        TxMethod::Unsupported(method_str.to_string())
-    };
-    let summary = format!(
-        "Solana destino={} lamports={} metodo={}",
-        payload.to_address, payload.lamports, method_str
-    );
+    let recipient = accounts
+        .get(to_index)
+        .ok_or_else(|| "indice de destinatario Solana fuera de rango".to_string())?;
+    let to_address = bs58::encode(recipient.as_slice()).into_string();
+    let value_units = lamports as u128;
+    let summary = format!("solana_transfer to={} lamports={}", to_address, lamports);
+
     Ok(ParsedTx {
         chain: ChainType::Solana,
-        to_address: payload.to_address.clone(),
-        value_units: payload.lamports as u128,
-        volume_units: native_units(ChainType::Solana, payload.lamports as u128),
+        to_address: to_address.clone(),
+        value_units,
+        volume_units: native_units(ChainType::Solana, value_units),
         destinations: vec![ParsedDestination {
-            address: payload.to_address,
-            value_units: payload.lamports as u128,
+            address: to_address,
+            value_units,
             kind: ParsedDestinationKind::Native,
         }],
         chain_id: 501,
-        method,
+        method: TxMethod::SolanaTransfer,
         summary,
     })
 }
@@ -450,6 +507,23 @@ impl<'a> ByteReader<'a> {
         Ok(u64::from_le_bytes(array))
     }
 
+    fn read_compact_u16(&mut self) -> Result<u16, String> {
+        let mut value: u32 = 0;
+        let mut shift: u32 = 0;
+        loop {
+            let byte = self.take(1)?[0];
+            value |= ((byte & 0x7f) as u32) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 14 {
+                return Err("compact-u16 Solana invalido".into());
+            }
+        }
+        u16::try_from(value).map_err(|_| "compact-u16 Solana fuera de rango".to_string())
+    }
+
     fn read_varint(&mut self) -> Result<u64, String> {
         let tag = self.take(1)?[0];
         match tag {
@@ -568,36 +642,48 @@ mod tests {
         assert!(matches!(parsed.method, TxMethod::BtcRawTx));
     }
 
-    #[test]
-    fn solana_transfer_uses_solana_transfer_method() {
-        let payload = serde_json::json!({
-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
-            "lamports": 1_000_000,
-            "method": "transfer"
-        });
-        let parsed = parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).unwrap();
-        assert!(matches!(parsed.method, TxMethod::SolanaTransfer));
+    fn solana_transfer_message(to: [u8; 32], lamports: u64) -> Vec<u8> {
+        let mut message = Vec::new();
+        message.extend_from_slice(&[1, 0, 1]); // cabecera del mensaje
+        message.push(3); // tres cuentas: emisor, destino, System Program
+        message.extend_from_slice(&[0x01; 32]); // emisor
+        message.extend_from_slice(&to); // destino
+        message.extend_from_slice(&[0x00; 32]); // System Program (todo ceros)
+        message.extend_from_slice(&[0x09; 32]); // blockhash reciente
+        message.push(1); // una instruccion
+        message.push(2); // program_id_index -> System Program
+        message.extend_from_slice(&[2, 0, 1]); // dos cuentas: emisor(0), destino(1)
+        message.push(12); // longitud de los datos
+        message.extend_from_slice(&[2, 0, 0, 0]); // discriminante Transfer
+        message.extend_from_slice(&lamports.to_le_bytes());
+        message
     }
 
     #[test]
-    fn solana_non_transfer_method_becomes_unsupported() {
-        let payload = serde_json::json!({
-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
-            "lamports": 1_000_000,
-            "method": "swap"
-        });
-        let parsed = parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).unwrap();
-        assert!(matches!(parsed.method, TxMethod::Unsupported(ref m) if m == "swap"));
+    fn solana_parses_system_transfer() {
+        let to = [0x2a; 32];
+        let message = solana_transfer_message(to, 1_000_000);
+        let parsed = parse_tx_payload(&ChainType::Solana, &message).unwrap();
+        assert!(matches!(parsed.method, TxMethod::SolanaTransfer));
+        assert_eq!(parsed.value_units, 1_000_000);
+        assert_eq!(parsed.to_address, bs58::encode(to).into_string());
+        assert_eq!(parsed.destinations.len(), 1);
+        assert_eq!(parsed.chain_id, 501);
+    }
+
+    #[test]
+    fn solana_rejects_non_system_instruction() {
+        let mut message = solana_transfer_message([0x2a; 32], 1_000_000);
+        // Corrompe la cuenta del System Program (offset cabecera+len+emisor+destino).
+        let system_offset = 3 + 1 + 32 + 32;
+        message[system_offset] = 0xff;
+        assert!(parse_tx_payload(&ChainType::Solana, &message).is_err());
     }
 
     #[test]
     fn solana_rejects_lamports_above_limit() {
-        let payload = serde_json::json!({
-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
-            "lamports": 100_000_000_000_001u64,
-            "method": "transfer"
-        });
-        assert!(parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).is_err());
+        let message = solana_transfer_message([0x2a; 32], 100_000_000_000_001);
+        assert!(parse_tx_payload(&ChainType::Solana, &message).is_err());
     }
 
     #[test]

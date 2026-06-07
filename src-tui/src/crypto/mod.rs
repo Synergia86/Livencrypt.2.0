@@ -5,3 +5,4 @@
 pub mod blockchain;
 pub mod file_cipher;
 pub mod positional;
+pub mod secure_text;
