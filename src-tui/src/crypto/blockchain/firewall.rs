@@ -7,7 +7,7 @@ use crate::crypto::blockchain::types::{ChainType, TxMethod};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FirewallRules {
@@ -41,6 +41,7 @@ pub struct LiveFirewall {
     pub tx_count_today: u32,
     pub volume_today_units: Decimal,
     pub last_reset_timestamp: u64,
+    reset_instant: Instant,
 }
 
 impl Default for LiveFirewall {
@@ -51,21 +52,23 @@ impl Default for LiveFirewall {
 
 impl LiveFirewall {
     pub fn new(rules: FirewallRules) -> Self {
-        let now = now_unix();
         Self {
             rules,
             tx_count_today: 0,
             volume_today_units: Decimal::ZERO,
-            last_reset_timestamp: now,
+            last_reset_timestamp: now_unix(),
+            reset_instant: Instant::now(),
         }
     }
 
     fn check_and_reset_daily_counters(&mut self) {
-        let now = now_unix();
-        if now.saturating_sub(self.last_reset_timestamp) >= 86_400 {
+        // El reinicio diario se mide con un reloj monotónico, inmune a retrocesos
+        // del reloj de pared que un atacante local podría usar para refrescar cuotas.
+        if self.reset_instant.elapsed() >= Duration::from_secs(86_400) {
             self.tx_count_today = 0;
             self.volume_today_units = Decimal::ZERO;
-            self.last_reset_timestamp = now;
+            self.reset_instant = Instant::now();
+            self.last_reset_timestamp = now_unix();
         }
     }
 
@@ -146,6 +149,53 @@ impl LiveFirewall {
                     }
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    /// Gobernanza de destino inmutable: toda firma debe declarar un `target_dex_cex_id`
+    /// que coincida con un destino real de la transacción y esté en lista blanca.
+    pub fn validate_target_destination_id(
+        &self,
+        parsed: &ParsedTx,
+        target_id: Option<&str>,
+    ) -> Result<(), String> {
+        let target = target_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                "destino inmutable obligatorio ausente: se requiere target_dex_cex_id".to_string()
+            })?;
+
+        let matches_real_destination = parsed.destinations.iter().any(|destination| {
+            matches!(
+                destination.kind,
+                ParsedDestinationKind::Native | ParsedDestinationKind::Erc20Receiver
+            ) && destination.address == target
+        });
+        if !matches_real_destination {
+            return Err(format!(
+                "violacion de destino inmutable: target_dex_cex_id '{}' no coincide con el destino real de la transaccion",
+                target
+            ));
+        }
+
+        let whitelisted = self
+            .rules
+            .allowed_dex_contracts
+            .iter()
+            .any(|contract| contract == target)
+            || self
+                .rules
+                .allowed_cex_destinations
+                .iter()
+                .any(|destination| destination == target);
+        if !whitelisted {
+            return Err(format!(
+                "violacion de destino inmutable: '{}' no esta en la lista blanca de DEX/CEX",
+                target
+            ));
         }
 
         Ok(())

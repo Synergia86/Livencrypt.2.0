@@ -64,7 +64,7 @@ impl Default for KdfParams {
     fn default() -> Self {
         Self {
             algorithm: KDF_ALGORITHM.to_string(),
-            memory_kib: 65_536,
+            memory_kib: 131_072,
             iterations: 3,
             parallelism: 1,
         }

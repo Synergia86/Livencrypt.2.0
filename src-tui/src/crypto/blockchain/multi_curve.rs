@@ -59,21 +59,22 @@ impl UniversalKeymaster {
         account: u32,
         index: u32,
     ) -> Result<[u8; 32], String> {
-        for candidate_index in index..index.saturating_add(32) {
-            let path = [
-                hardened(44),
-                hardened(coin_type),
-                hardened(account),
-                0,
-                candidate_index,
-            ];
-            if let Ok(mut key) = derive_bip32_secp_path(&self.master_seed, &path) {
-                let out = key;
-                key.zeroize();
-                return Ok(out);
-            }
-        }
-        Err("No se pudo derivar clave secp256k1 valida en ventana BIP32".into())
+        let path = [
+            hardened(44),
+            hardened(coin_type),
+            hardened(account),
+            0,
+            index,
+        ];
+        let mut key = derive_bip32_secp_path(&self.master_seed, &path).map_err(|error| {
+            format!(
+                "clave secp256k1 invalida en el indice {} solicitado: {}",
+                index, error
+            )
+        })?;
+        let out = key;
+        key.zeroize();
+        Ok(out)
     }
 
     fn derive_slip10_ed25519_child(&self, account: u32, index: u32) -> Result<[u8; 32], String> {
@@ -175,6 +176,7 @@ impl UniversalKeymaster {
                 }
                 ChainType::Solana => {
                     let sk = SigningKey::from_bytes(&raw_key);
+                    // El payload ya es el mensaje Solana serializado; ed25519 firma esos bytes.
                     let sig = sk.sign(raw_payload);
 
                     Ok(SignatureResponse {

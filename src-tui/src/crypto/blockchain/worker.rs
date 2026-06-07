@@ -146,11 +146,26 @@ fn spawn_socket_reader(
                 continue;
             }
 
-            if active_connections.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
+            // Reserva de slot atómica: comparar-e-intercambiar evita que ráfagas
+            // concurrentes superen el límite por una condición de carrera load/add.
+            let mut current = active_connections.load(Ordering::Acquire);
+            let reserved = loop {
+                if current >= MAX_CONCURRENT_CONNECTIONS {
+                    break false;
+                }
+                match active_connections.compare_exchange_weak(
+                    current,
+                    current + 1,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break true,
+                    Err(observed) => current = observed,
+                }
+            };
+            if !reserved {
                 continue;
             }
-
-            active_connections.fetch_add(1, Ordering::Relaxed);
             let thread_tx = cmd_tx.clone();
             let counter = Arc::clone(&active_connections);
 
@@ -162,7 +177,7 @@ fn spawn_socket_reader(
                 if let Ok(payload) = read_native_message(&mut stream) {
                     let _ = thread_tx.send(Web3WorkerCmd::IncomingWebRequest(payload, stream));
                 }
-                counter.fetch_sub(1, Ordering::Relaxed);
+                counter.fetch_sub(1, Ordering::Release);
             });
         }
 

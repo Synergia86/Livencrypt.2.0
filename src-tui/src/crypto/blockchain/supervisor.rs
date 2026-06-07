@@ -83,6 +83,18 @@ impl GatewaySupervisor {
                     ));
                     return serde_json::to_vec(&response).map_err(|error| error.to_string());
                 }
+
+                if let Err(target_error) = self.firewall.validate_target_destination_id(
+                    &parsed,
+                    sign_request.target_dex_cex_id.as_deref(),
+                ) {
+                    self.register_integrity_failure(&target_error, now);
+                    let response = ExtensionResponse::<()>::Error(format!(
+                        "violacion de perimetro: {}",
+                        target_error
+                    ));
+                    return serde_json::to_vec(&response).map_err(|error| error.to_string());
+                }
                 let effective_volume = match self.firewall.effective_volume_units(&parsed) {
                     Ok(volume) => volume,
                     Err(error) => {
