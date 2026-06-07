@@ -1,0 +1,9 @@
+{
+  "name": "com.livencrypt.gateway",
+  "description": "Proxy criptografico universal aislado de Livencrypt 2.0",
+  "path": "/usr/bin/livencrypt-bridge",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://iealgmhdifbjdmlffgkccejpbnmefkkl/"
+  ]
+}

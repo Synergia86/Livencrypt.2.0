@@ -1,0 +1,43 @@
+FROM rust:1-bookworm
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends iproute2 ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY tests ./tests
+COPY scripts ./scripts
+COPY packaging ./packaging
+
+RUN cargo build --release --locked
+
+RUN set -eu; \
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'exec "$@"' \
+    > /usr/local/bin/pkexec; \
+  chmod 0755 /usr/local/bin/pkexec; \
+  printf '%s\n' \
+    '#!/bin/sh' \
+    'set -eu' \
+    'echo "$*" >> /tmp/livencrypt-nmcli-shim.log' \
+    'case "$*" in' \
+    '  "networking off") printf "off\n" > /tmp/livencrypt-nmcli-state ;;' \
+    '  "networking on") printf "on\n" > /tmp/livencrypt-nmcli-state ;;' \
+    'esac' \
+    'exit 0' \
+    > /usr/local/bin/nmcli; \
+  chmod 0755 /usr/local/bin/nmcli
+
+ENV HOME=/home/livencrypt
+ENV XDG_DATA_HOME=/tmp/livencrypt-data
+ENV LIVENCRYPT_CONTAINER_NETWORK_TEST=1
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+RUN useradd -m -u 1000 livencrypt
+
+CMD ["./target/release/livencrypt-core", "--network-self-test-container-only"]

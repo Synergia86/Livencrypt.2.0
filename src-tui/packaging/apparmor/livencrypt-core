@@ -1,0 +1,43 @@
+#include <tunables/global>
+
+/usr/bin/livencrypt-core {
+  #include <abstractions/base>
+
+  capability ipc_lock,
+  capability setpcap,
+  capability sys_resource,
+
+  deny network,
+
+  /dev/tty rw,
+  /dev/ptmx rw,
+  owner /dev/pts/[0-9]* rw,
+  owner /dev/pts/** rw,
+
+  /tmp/ rw,
+  owner /tmp/livencrypt-*/ rwk,
+  owner /tmp/livencrypt-*/** rwk,
+  owner /tmp/livencrypt-safe-self-test-*/ rwk,
+  owner /tmp/livencrypt-safe-self-test-*/** rwk,
+  /var/tmp/ rw,
+  owner /var/tmp/livencrypt-*/ rwk,
+  owner /var/tmp/livencrypt-*/** rwk,
+
+  @{PROC}/@{pid}/exe r,
+  @{PROC}/@{pid}/fd/ r,
+  @{PROC}/@{pid}/fd/** r,
+  @{PROC}/@{pid}/maps r,
+  @{PROC}/@{pid}/status r,
+
+  owner @{HOME}/.local/share/ rw,
+  owner @{HOME}/.local/share/livencrypt/ rw,
+  owner @{HOME}/.local/share/livencrypt/** rwk,
+  owner @{HOME}/.config/ rw,
+  owner @{HOME}/.config/livencrypt/ rw,
+  owner @{HOME}/.config/livencrypt/** rwk,
+  /etc/livencrypt/** r,
+  /usr/bin/livencrypt-core rix,
+
+  deny /etc/shadow r,
+  deny /root/** rwklx,
+}

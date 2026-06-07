@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
+/* rol: Biblioteca del núcleo de la aplicación */
+
+#![deny(unsafe_code)]
+
+pub mod crypto;
+pub mod security;
+pub mod templates;
+
+use crate::crypto::file_cipher::{FileCipher, FileInfo};
+use crate::crypto::positional::{CipherResult, PositionalCipher};
+use crate::templates::TemplateData;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn livencrypt_base_dir() -> PathBuf {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(data_home).join("livencrypt");
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("livencrypt");
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(manifest_dir)
+}
+
+pub fn initialize_core() {
+    let hardening_status = crate::security::initialize_process_hardening();
+    for warning in &hardening_status.warnings {
+        eprintln!("[SECURITY] {}", warning);
+    }
+
+    crate::crypto::file_cipher::configure_chunk_tasks();
+    if let Err(error) = crate::templates::initialize_defaults() {
+        eprintln!("[INIT] Error inicializando plantillas: {}", error);
+    }
+}
+
+pub fn initialize_core_without_process_hardening() -> Result<(), String> {
+    crate::crypto::file_cipher::configure_chunk_tasks();
+    crate::templates::initialize_defaults()
+}
+
+pub fn load_templates() -> Result<HashMap<String, TemplateData>, String> {
+    crate::templates::load_templates()
+}
+
+pub fn list_templates() -> Result<HashMap<String, TemplateData>, String> {
+    load_templates()
+}
+
+pub fn save_template(name: String, data: TemplateData) -> Result<(), String> {
+    crate::templates::save_template(name, data)
+}
+
+pub fn delete_template(name: String) -> Result<(), String> {
+    crate::templates::delete_template(name)
+}
+
+pub fn language_characters() -> HashMap<String, Vec<String>> {
+    crate::templates::get_language_characters()
+}
+
+pub fn language_numbers_signs() -> HashMap<String, Vec<String>> {
+    crate::templates::get_language_numbers_signs()
+}
+
+pub fn resolve_template(name: &str) -> Result<TemplateData, String> {
+    if name == "filelivencrypt" || name == "Livencrypt" {
+        return Ok(crate::templates::filelivencrypt_template());
+    }
+
+    load_templates()?
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("Plantilla no encontrada: {}", name))
+}
+
+pub fn cipher_text(
+    text: &str,
+    template_name: &str,
+    cajas: [i64; 5],
+    password_length: usize,
+    password_direction: &str,
+    control_symbols: &str,
+) -> Result<CipherResult, String> {
+    let template = resolve_template(template_name)?;
+    let cipher = PositionalCipher::new(template);
+    Ok(cipher.cifrar_with_password_config(
+        text,
+        cajas[0],
+        cajas[1],
+        cajas[2],
+        cajas[3],
+        cajas[4],
+        password_length,
+        password_direction,
+        control_symbols,
+    ))
+}
+
+pub fn decipher_text(
+    text: &str,
+    template_name: &str,
+    cajas: [i64; 5],
+    password_length: usize,
+    password_direction: &str,
+    control_symbols: &str,
+) -> Result<CipherResult, String> {
+    let template = resolve_template(template_name)?;
+    let cipher = PositionalCipher::new(template);
+    Ok(cipher.descifrar_with_password_config(
+        text,
+        cajas[0],
+        cajas[1],
+        cajas[2],
+        cajas[3],
+        cajas[4],
+        password_length,
+        password_direction,
+        control_symbols,
+    ))
+}
+
+pub fn load_file_info(path: &Path) -> Result<FileInfo, String> {
+    FileCipher::load_file_info(path)
+}
+
+pub fn cipher_file(
+    _input_path: &Path,
+    _output_path: &Path,
+    _referencia: &str,
+    _template_name: &str,
+    _cajas: [i64; 5],
+) -> Result<(), String> {
+    Err("cipher_file legacy bloqueado: use cipher_file_with_secret() con clave de archivo.".into())
+}
+
+pub fn cipher_file_with_secret(
+    input_path: &Path,
+    output_path: &Path,
+    referencia: &str,
+    template_name: &str,
+    cajas: [i64; 5],
+    file_secret: &str,
+) -> Result<(), String> {
+    let template = resolve_template(template_name)?;
+    FileCipher::encrypt_file_authenticated(
+        input_path,
+        output_path,
+        referencia,
+        &template,
+        cajas,
+        file_secret,
+    )
+}
+
+pub fn decipher_file(
+    _input_path: &Path,
+    _output_path: &Path,
+    _referencia: &str,
+    _is_txt_output: bool,
+    _template_name: &str,
+    _cajas: [i64; 5],
+) -> Result<(), String> {
+    Err(
+        "decipher_file legacy bloqueado: use decipher_file_with_secret() con clave de archivo."
+            .into(),
+    )
+}
+
+pub fn decipher_file_with_secret(
+    input_path: &Path,
+    output_path: &Path,
+    referencia: &str,
+    is_txt_output: bool,
+    template_name: &str,
+    cajas: [i64; 5],
+    file_secret: &str,
+) -> Result<(), String> {
+    let template = resolve_template(template_name)?;
+    FileCipher::decrypt_file_authenticated(
+        input_path,
+        output_path,
+        referencia,
+        is_txt_output,
+        &template,
+        cajas,
+        file_secret,
+    )
+}
+
+pub fn save_cipher_result(temp_path: &Path, save_path: &Path) -> Result<(), String> {
+    FileCipher::save_result(temp_path, save_path)
+}

@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+TITLE="Livencrypt 2.0"
+CMD="/usr/bin/livencrypt-core"
+WM_CLASS="LivencryptCore"
+ICON="/usr/share/icons/hicolor/128x128/apps/livencrypt-core.png"
+
+if command -v xfce4-terminal >/dev/null 2>&1; then
+  exec xfce4-terminal --class="$WM_CLASS" --icon="$ICON" --title="$TITLE" --command="$CMD"
+fi
+
+if command -v mate-terminal >/dev/null 2>&1; then
+  exec mate-terminal --class="$WM_CLASS" --title="$TITLE" -e "$CMD"
+fi
+
+if command -v gnome-terminal >/dev/null 2>&1; then
+  exec gnome-terminal --class="$WM_CLASS" --title="$TITLE" -- "$CMD"
+fi
+
+if command -v konsole >/dev/null 2>&1; then
+  exec konsole --new-tab --workdir "$HOME" --qwindowtitle "$TITLE" -p tabtitle="$TITLE" -e "$CMD"
+fi
+
+if command -v xterm >/dev/null 2>&1; then
+  exec xterm -class "$WM_CLASS" -name "$WM_CLASS" -T "$TITLE" -e "$CMD"
+fi
+
+if command -v x-terminal-emulator >/dev/null 2>&1; then
+  exec x-terminal-emulator -T "$TITLE" -e "$CMD"
+fi
+
+exec "$CMD"

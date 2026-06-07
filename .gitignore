@@ -1,0 +1,18 @@
+# directorios de compilacion de rust
+/target/
+/src-tauri/target/
+
+# dependencias de javascript / tauri (si aplica)
+node_modules/
+dist/
+
+# archivos temporales y sockets locales detectados en tu configuracion
+*.tmp
+*.sock
+/tmp/
+
+# archivos del sistema operativo y entornos locales
+.env
+.DS_Store
+.idea/
+.vscode/

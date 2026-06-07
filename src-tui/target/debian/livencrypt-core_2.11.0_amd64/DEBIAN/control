@@ -1,0 +1,10 @@
+Package: livencrypt-core
+Version: 2.11.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Maintainer: Synergia86
+Depends: libc6, libcap2-bin
+Description: Livencrypt 2.0 - TUI segura para texto, archivo y plantillas
+ Interfaz de terminal para Livencrypt 2.0 sin WebView ni frontend web.
+ Incluye hardening de proceso, Boot Shield y nucleo criptografico local.

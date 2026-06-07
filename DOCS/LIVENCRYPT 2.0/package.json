@@ -1,0 +1,52 @@
+{
+  "name": "livencrypt",
+  "private": true,
+  "description": "Livencrypt 2.0 - Texto, archivo y editor de plantillas",
+  "license": "GPL-3.0-or-later",
+  "version": "2.11.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@fontsource/jetbrains-mono": "^5.2.8",
+    "@fontsource/noto-sans-arabic": "^5.2.10",
+    "@fontsource/noto-sans-armenian": "^5.2.8",
+    "@fontsource/noto-sans-bengali": "^5.2.11",
+    "@fontsource/noto-sans-cherokee": "^5.2.8",
+    "@fontsource/noto-sans-devanagari": "^5.2.8",
+    "@fontsource/noto-sans-ethiopic": "^5.2.7",
+    "@fontsource/noto-sans-georgian": "^5.2.8",
+    "@fontsource/noto-sans-jp": "^5.2.9",
+    "@fontsource/noto-sans-kannada": "^5.2.9",
+    "@fontsource/noto-sans-khmer": "^5.2.8",
+    "@fontsource/noto-sans-kr": "^5.2.9",
+    "@fontsource/noto-sans-myanmar": "^5.2.7",
+    "@fontsource/noto-sans-sc": "^5.2.9",
+    "@fontsource/noto-sans-sinhala": "^5.2.10",
+    "@fontsource/noto-sans-symbols": "^5.2.11",
+    "@fontsource/noto-sans-symbols-2": "^5.2.8",
+    "@fontsource/noto-sans-thai": "^5.2.8",
+    "@fontsource/noto-serif-tibetan": "^5.2.8",
+    "@tailwindcss/vite": "^4.2.4",
+    "@tauri-apps/api": "^2.11.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-opener": "^2.5.4",
+    "framer-motion": "^12.38.0",
+    "lucide-react": "^1.11.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.2.4"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}

@@ -1,0 +1,10 @@
+Livencrypt 2.0 TUI
+==================
+
+Ejecute desde terminal:
+
+  livencrypt-core
+
+Diagnostico de hardening:
+
+  livencrypt-core --hardening-check
