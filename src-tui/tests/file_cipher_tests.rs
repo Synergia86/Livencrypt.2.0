@@ -491,7 +491,9 @@ mod tests {
         .unwrap_err()
         .contains("plantilla"));
 
-        assert!(FileCipher::decrypt_file_authenticated(
+        // Cajas incorrectas: ahora se rechazan vía AEAD (las cajas entran en la clave),
+        // sin publicar un hash sin sal fuerza-bruteable de las cajas.
+        let err_cajas = FileCipher::decrypt_file_authenticated(
             &encrypted_path,
             &decrypted_path,
             reference,
@@ -500,10 +502,15 @@ mod tests {
             [5, 7, 2, 3, 8],
             secret,
         )
-        .unwrap_err()
-        .contains("cajas"));
+        .unwrap_err();
+        assert!(
+            err_cajas.contains("cajas")
+                || err_cajas.contains("AEAD")
+                || err_cajas.contains("clave incorrecta")
+        );
 
-        assert!(FileCipher::decrypt_file_authenticated(
+        // Referencia incorrecta: idem, rechazo vía AEAD (la referencia entra en la clave).
+        let err_ref = FileCipher::decrypt_file_authenticated(
             &encrypted_path,
             &decrypted_path,
             "otra referencia segura 2026",
@@ -512,8 +519,12 @@ mod tests {
             cajas,
             secret,
         )
-        .unwrap_err()
-        .contains("referencia"));
+        .unwrap_err();
+        assert!(
+            err_ref.contains("referencia")
+                || err_ref.contains("AEAD")
+                || err_ref.contains("clave incorrecta")
+        );
 
         let _ = std::fs::remove_file(&original_path);
         let _ = std::fs::remove_file(&encrypted_path);

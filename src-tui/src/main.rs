@@ -922,7 +922,12 @@ impl TuiState {
         let keymaster = UniversalKeymaster::new(cajas, master_phrase)?;
         let default_rules = FirewallRules::default();
         let firewall = LiveFirewall::new(default_rules);
-        let supervisor = GatewaySupervisor::new(keymaster, firewall);
+        let mut supervisor = GatewaySupervisor::new(keymaster, firewall);
+        // Vincula la combinación EXACTA (5 cajas + frase maestra) requerida para
+        // descongelar el disyuntor. Sin esto el rearme aceptaba cualquier credencial.
+        supervisor
+            .breaker
+            .set_rearm_credentials(cajas, master_phrase)?;
 
         self.input_max_tx = supervisor.firewall.rules.max_daily_tx.to_string();
         self.input_max_volume = supervisor.firewall.rules.max_daily_volume_units.to_string();
