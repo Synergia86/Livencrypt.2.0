@@ -359,8 +359,13 @@ impl FileCipher {
             salt,
             nonce,
             template_sha256: template_sha256(template)?,
-            cajas_sha256: cajas_sha256(cajas),
-            referencia_sha256: sha256_bytes(referencia.as_bytes()),
+            // CWE-916: NO publicar SHA-256 sin sal de valores de baja entropía.
+            // Las cajas y la referencia ya entran en la clave Argon2id+AEAD, así que
+            // estos hashes eran redundantes y permitían fuerza bruta offline (recuperar
+            // cajas/referencia sin pagar el coste del KDF). Se dejan vacíos; el AEAD es
+            // la única autoridad. Los archivos antiguos siguen verificándose (ver decrypt).
+            cajas_sha256: Vec::new(),
+            referencia_sha256: Vec::new(),
             is_txt_output_hint: false,
         };
 
@@ -391,10 +396,17 @@ impl FileCipher {
         if envelope.header.template_sha256 != template_sha256(template)? {
             return Err("La plantilla no coincide con la usada al cifrar.".to_string());
         }
-        if envelope.header.cajas_sha256 != cajas_sha256(cajas) {
+        // Compatibilidad: archivos antiguos llevaban estos hashes; si están presentes
+        // se siguen verificando. Los archivos nuevos los omiten y delegan en el AEAD
+        // (cajas/referencia incorrectas -> fallo de autenticación AEAD igualmente).
+        if !envelope.header.cajas_sha256.is_empty()
+            && envelope.header.cajas_sha256 != cajas_sha256(cajas)
+        {
             return Err("Las cajas no coinciden con las usadas al cifrar.".to_string());
         }
-        if envelope.header.referencia_sha256 != sha256_bytes(referencia.as_bytes()) {
+        if !envelope.header.referencia_sha256.is_empty()
+            && envelope.header.referencia_sha256 != sha256_bytes(referencia.as_bytes())
+        {
             return Err("La referencia no coincide con la usada al cifrar.".to_string());
         }
 
