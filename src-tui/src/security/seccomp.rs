@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
+/* rol: filtro seccomp BPF de denegación de syscalls peligrosas */
+
+#[cfg(target_os = "linux")]
+use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+
+pub const SECCOMP_ENV_FLAG: &str = "LIVENCRYPT_SECCOMP";
+
+pub fn seccomp_requested() -> bool {
+    std::env::var_os(SECCOMP_ENV_FLAG).is_some()
+}
+
+#[cfg(target_os = "linux")]
+fn target_arch() -> Result<TargetArch, String> {
+    if cfg!(target_arch = "x86_64") {
+        Ok(TargetArch::x86_64)
+    } else if cfg!(target_arch = "aarch64") {
+        Ok(TargetArch::aarch64)
+    } else {
+        Err("arquitectura no soportada por el filtro seccomp".to_string())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn denied_syscalls() -> Vec<libc::c_long> {
+    // Llamadas que comprometen memoria, depuracion o persistencia del nucleo.
+    vec![
+        libc::SYS_ptrace,
+        libc::SYS_process_vm_readv,
+        libc::SYS_process_vm_writev,
+        libc::SYS_kexec_load,
+        libc::SYS_kexec_file_load,
+        libc::SYS_init_module,
+        libc::SYS_finit_module,
+        libc::SYS_delete_module,
+        libc::SYS_iopl,
+        libc::SYS_ioperm,
+        libc::SYS_perf_event_open,
+        libc::SYS_personality,
+        libc::SYS_mount,
+        libc::SYS_umount2,
+        libc::SYS_pivot_root,
+        libc::SYS_setns,
+        libc::SYS_swapon,
+        libc::SYS_swapoff,
+    ]
+}
+
+/// Aplica una lista negra de syscalls peligrosas (acción por defecto permitir,
+/// matar el proceso si se invoca una de la lista). No es una lista blanca estricta
+/// para no bloquear el arranque de la TUI; el endurecimiento total se activa con
+/// la variable de entorno y puede afinarse a whitelist tras pruebas en destino.
+#[cfg(target_os = "linux")]
+pub fn apply_syscall_denylist() -> Result<(), String> {
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    for syscall in denied_syscalls() {
+        rules.insert(syscall as i64, Vec::new());
+    }
+
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::KillProcess,
+        target_arch()?,
+    )
+    .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
+
+    let program: BpfProgram = filter
+        .try_into()
+        .map_err(|error| format!("no se pudo compilar el filtro seccomp: {}", error))?;
+
+    apply_filter(&program).map_err(|error| format!("no se pudo aplicar el filtro seccomp: {}", error))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn apply_syscall_denylist() -> Result<(), String> {
+    Err("seccomp solo esta disponible en Linux".to_string())
+}

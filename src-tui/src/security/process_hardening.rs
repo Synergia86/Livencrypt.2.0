@@ -210,6 +210,12 @@ pub fn process_hardening_status() -> ProcessHardeningStatus {
     initialize_process_hardening()
 }
 
+/// Devuelve el estado de endurecimiento solo si ya fue inicializado, sin aplicarlo.
+/// Permite consultar el riesgo sin provocar efectos colaterales (mlockall, prctl).
+pub fn hardening_status_peek() -> Option<ProcessHardeningStatus> {
+    HARDENING_STATUS.get().cloned()
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
