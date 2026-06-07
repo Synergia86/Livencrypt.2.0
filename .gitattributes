@@ -1,0 +1,6 @@
+**/*.sh linguist-vendored
+**/*.html linguist-vendored
+**/*.json linguist-vendored
+**/*.snapshot linguist-vendored
+
+**/*.rs linguist-detectable=true
