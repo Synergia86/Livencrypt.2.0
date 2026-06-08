@@ -25,8 +25,8 @@ pub use network_profile::{get_network_profile, set_network_profile, toggle_netwo
 pub use process_hardening::{initialize_process_hardening, process_hardening_status};
 pub use vault::{
     boot_shield_destructive_panic, boot_shield_disable, boot_shield_enable,
-    boot_shield_factory_reset, boot_shield_hardened_lock, boot_shield_lock, boot_shield_status,
-    boot_shield_unlock, BootShieldStatus,
+    boot_shield_factory_reset, boot_shield_hardened_lock, boot_shield_lock,
+    boot_shield_set_duress_key, boot_shield_status, boot_shield_unlock, BootShieldStatus,
 };
 
 pub fn vault_is_configured() -> bool {

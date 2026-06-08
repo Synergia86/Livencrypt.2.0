@@ -69,7 +69,9 @@ where
         read_result.map_err(|_| "el firmante aislado no devolvio longitud".to_string())?;
         let length = u32::from_le_bytes(length_buffer) as usize;
         if length == 0 {
-            return Err("el firmante aislado no produjo firma (aislamiento no disponible)".to_string());
+            return Err(
+                "el firmante aislado no produjo firma (aislamiento no disponible)".to_string(),
+            );
         }
         let mut payload = vec![0u8; length];
         stream

@@ -6,7 +6,9 @@ use livencrypt_lib::security::boot_shield::{self, BootKey};
 use std::process::ExitCode;
 
 fn usage() -> ExitCode {
-    eprintln!("uso: livencrypt-boot-shield <seal|unseal|verify> <clave-hex-32B> <entrada> [salida]");
+    eprintln!(
+        "uso: livencrypt-boot-shield <seal|unseal|verify> <clave-hex-32B> <entrada> [salida]"
+    );
     ExitCode::from(2)
 }
 

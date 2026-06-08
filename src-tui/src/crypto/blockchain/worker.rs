@@ -7,8 +7,13 @@
 /* rol: hilo de ejecucion asincrono multi-hilo blindado contra slowloris y fugas de heap */
 use crate::crypto::blockchain::breaker::GatewaySecurityState;
 use crate::crypto::blockchain::firewall::FirewallRules;
-use crate::crypto::blockchain::proxy::{read_native_message, write_native_message};
+use crate::crypto::blockchain::proxy::{
+    read_native_message, write_native_message, ExtensionRequest, ExtensionResponse,
+};
 use crate::crypto::blockchain::supervisor::GatewaySupervisor;
+use crate::crypto::blockchain::types::{
+    ChainType, KeyDerivationRequest, SigningRequestPreview, TransactionSignRequest,
+};
 use rust_decimal::Decimal;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::fs::PermissionsExt;
@@ -25,6 +30,12 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 8;
 const SOCKET_READ_TIMEOUT_MS: u64 = 200;
 const MAX_WHITELIST_ITEMS: usize = 100;
 
+struct PendingSigningRequest {
+    request_id: u64,
+    request: TransactionSignRequest,
+    stream: UnixStream,
+}
+
 pub enum Web3WorkerCmd {
     UpdateRules {
         max_tx: Option<u32>,
@@ -33,6 +44,15 @@ pub enum Web3WorkerCmd {
     AddDexContract(String),
     AddCexDestination(String),
     ResetBreaker([i64; 5], Vec<u8>),
+    DerivePublicKey {
+        chain: ChainType,
+        account_index: u32,
+        address_index: u32,
+    },
+    AuthorizeSigning {
+        request_id: u64,
+        approve: bool,
+    },
     IncomingWebRequest(Vec<u8>, UnixStream),
     Shutdown,
 }
@@ -44,6 +64,13 @@ pub enum Web3WorkerEvent {
         volume_units: Decimal,
     },
     SyncRules(FirewallRules),
+    SigningRequest(SigningRequestPreview),
+    PublicKeyDerived {
+        chain: ChainType,
+        account_index: u32,
+        address_index: u32,
+        result: Result<Vec<u8>, String>,
+    },
     Notification(String),
 }
 
@@ -62,6 +89,8 @@ impl Web3BackgroundWorker {
         thread::spawn(move || {
             let mut last_tx_count = 0;
             let mut last_volume_units = Decimal::ZERO;
+            let mut pending_signing: Option<PendingSigningRequest> = None;
+            let mut next_signing_request_id = 1_u64;
 
             loop {
                 match cmd_rx.recv_timeout(Duration::from_millis(200)) {
@@ -69,7 +98,13 @@ impl Web3BackgroundWorker {
                         running.store(false, Ordering::Relaxed);
                         break;
                     }
-                    Ok(cmd) => process_command(cmd, &mut supervisor, &event_tx),
+                    Ok(cmd) => process_command(
+                        cmd,
+                        &mut supervisor,
+                        &event_tx,
+                        &mut pending_signing,
+                        &mut next_signing_request_id,
+                    ),
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
@@ -189,6 +224,8 @@ fn process_command(
     cmd: Web3WorkerCmd,
     supervisor: &mut GatewaySupervisor,
     event_tx: &Sender<Web3WorkerEvent>,
+    pending_signing: &mut Option<PendingSigningRequest>,
+    next_signing_request_id: &mut u64,
 ) {
     match cmd {
         Web3WorkerCmd::UpdateRules { max_tx, max_vol } => {
@@ -317,16 +354,138 @@ fn process_command(
             }
             phrase_bytes.zeroize();
         }
-        Web3WorkerCmd::IncomingWebRequest(mut payload, mut stream) => {
+        Web3WorkerCmd::DerivePublicKey {
+            chain,
+            account_index,
+            address_index,
+        } => {
             let old_state = supervisor.breaker.state.clone();
-            let response = supervisor.handle_native_payload(&payload);
-            let _ = write_native_message(&mut stream, &response);
-            payload.zeroize();
-
+            let request = ExtensionRequest::DeriveKey(KeyDerivationRequest {
+                chain: chain.clone(),
+                account_index,
+                address_index,
+            });
+            let result = supervisor.run_loop_iteration(request).and_then(|bytes| {
+                serde_json::from_slice::<ExtensionResponse<Vec<u8>>>(&bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(|response| match response {
+                        ExtensionResponse::Success(public_key) => Ok(public_key),
+                        ExtensionResponse::Error(error) => Err(error),
+                    })
+            });
+            let _ = event_tx.send(Web3WorkerEvent::PublicKeyDerived {
+                chain,
+                account_index,
+                address_index,
+                result,
+            });
             if supervisor.breaker.state != old_state {
                 let _ = event_tx.send(Web3WorkerEvent::StatusChanged(
                     supervisor.breaker.state.clone(),
                 ));
+            }
+        }
+        Web3WorkerCmd::AuthorizeSigning {
+            request_id,
+            approve,
+        } => {
+            let Some(mut pending) = pending_signing.take() else {
+                let _ = event_tx.send(Web3WorkerEvent::Notification(
+                    "No hay firma Web3 pendiente.".to_string(),
+                ));
+                return;
+            };
+            if pending.request_id != request_id {
+                let _ = event_tx.send(Web3WorkerEvent::Notification(
+                    "Solicitud de firma Web3 no coincide; rechazada.".to_string(),
+                ));
+                write_error_response(&mut pending.stream, "solicitud de firma obsoleta");
+                return;
+            }
+
+            if !approve {
+                write_error_response(&mut pending.stream, "firma rechazada por operador");
+                let _ = event_tx.send(Web3WorkerEvent::Notification(
+                    "Firma Web3 rechazada por operador.".to_string(),
+                ));
+                return;
+            }
+
+            let old_state = supervisor.breaker.state.clone();
+            let response =
+                supervisor.run_loop_iteration(ExtensionRequest::SignTransaction(pending.request));
+            let bytes = response.unwrap_or_else(error_response_bytes);
+            let _ = write_native_message(&mut pending.stream, &bytes);
+            if supervisor.breaker.state != old_state {
+                let _ = event_tx.send(Web3WorkerEvent::StatusChanged(
+                    supervisor.breaker.state.clone(),
+                ));
+            }
+            let _ = event_tx.send(Web3WorkerEvent::Notification(
+                "Firma Web3 procesada tras autorizacion local.".to_string(),
+            ));
+        }
+        Web3WorkerCmd::IncomingWebRequest(mut payload, mut stream) => {
+            let request = serde_json::from_slice::<ExtensionRequest>(&payload);
+            payload.zeroize();
+            match request {
+                Ok(ExtensionRequest::SignTransaction(sign_request)) => {
+                    if pending_signing.is_some() {
+                        write_error_response(
+                            &mut stream,
+                            "ya existe una firma pendiente de autorizacion local",
+                        );
+                        return;
+                    }
+
+                    let old_state = supervisor.breaker.state.clone();
+                    match supervisor.preview_sign_transaction(&sign_request) {
+                        Ok(mut preview) => {
+                            let request_id = *next_signing_request_id;
+                            *next_signing_request_id = (*next_signing_request_id).saturating_add(1);
+                            preview.request_id = request_id;
+                            *pending_signing = Some(PendingSigningRequest {
+                                request_id,
+                                request: sign_request,
+                                stream,
+                            });
+                            let _ = event_tx.send(Web3WorkerEvent::SigningRequest(preview));
+                            let _ = event_tx.send(Web3WorkerEvent::Notification(
+                                "Firma Web3 pendiente de autorizacion local.".to_string(),
+                            ));
+                        }
+                        Err(error) => {
+                            write_error_response(&mut stream, &error);
+                            let _ = event_tx.send(Web3WorkerEvent::Notification(format!(
+                                "Firma Web3 rechazada en prevalidacion: {}",
+                                error
+                            )));
+                        }
+                    }
+                    if supervisor.breaker.state != old_state {
+                        let _ = event_tx.send(Web3WorkerEvent::StatusChanged(
+                            supervisor.breaker.state.clone(),
+                        ));
+                    }
+                }
+                Ok(request) => {
+                    let old_state = supervisor.breaker.state.clone();
+                    let response = supervisor
+                        .run_loop_iteration(request)
+                        .unwrap_or_else(error_response_bytes);
+                    let _ = write_native_message(&mut stream, &response);
+                    if supervisor.breaker.state != old_state {
+                        let _ = event_tx.send(Web3WorkerEvent::StatusChanged(
+                            supervisor.breaker.state.clone(),
+                        ));
+                    }
+                }
+                Err(error) => {
+                    write_error_response(
+                        &mut stream,
+                        &format!("error de deserializacion estructurada: {}", error),
+                    );
+                }
             }
         }
         Web3WorkerCmd::Shutdown => {}
@@ -335,6 +494,17 @@ fn process_command(
 
 fn normalize_id(value: &mut String) {
     *value = value.trim().to_string();
+}
+
+fn write_error_response(stream: &mut UnixStream, error: &str) {
+    let payload = error_response_bytes(error.to_string());
+    let _ = write_native_message(stream, &payload);
+}
+
+fn error_response_bytes(error: String) -> Vec<u8> {
+    serde_json::to_vec(&ExtensionResponse::<()>::Error(error)).unwrap_or_else(|_| {
+        b"{\"status\":\"Error\",\"data\":\"error interno de serializacion\"}".to_vec()
+    })
 }
 
 fn resolve_socket_path() -> Result<PathBuf, String> {

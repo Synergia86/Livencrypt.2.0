@@ -3,7 +3,9 @@
 /* rol: filtro seccomp BPF de denegación de syscalls peligrosas */
 
 #[cfg(target_os = "linux")]
-use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
+use seccompiler::{
+    apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
+};
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
 
@@ -57,7 +59,7 @@ fn denied_syscalls() -> Vec<libc::c_long> {
 pub fn apply_syscall_denylist() -> Result<(), String> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for syscall in denied_syscalls() {
-        rules.insert(syscall as i64, Vec::new());
+        rules.insert(syscall, Vec::new());
     }
 
     let filter = SeccompFilter::new(
@@ -72,7 +74,8 @@ pub fn apply_syscall_denylist() -> Result<(), String> {
         .try_into()
         .map_err(|error| format!("no se pudo compilar el filtro seccomp: {}", error))?;
 
-    apply_filter(&program).map_err(|error| format!("no se pudo aplicar el filtro seccomp: {}", error))
+    apply_filter(&program)
+        .map_err(|error| format!("no se pudo aplicar el filtro seccomp: {}", error))
 }
 
 #[cfg(not(target_os = "linux"))]

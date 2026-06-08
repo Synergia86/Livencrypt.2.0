@@ -100,7 +100,10 @@ mod tests {
     fn boot_shield_seal_open_roundtrip() {
         let key = BootKey::from_passphrase("frase de arranque del sistema");
         let sealed = seal_config(&key, b"configuracion critica").expect("sellar");
-        assert_eq!(open_config(&key, &sealed).expect("abrir"), b"configuracion critica");
+        assert_eq!(
+            open_config(&key, &sealed).expect("abrir"),
+            b"configuracion critica"
+        );
         assert!(verify_config(&key, &sealed));
     }
 

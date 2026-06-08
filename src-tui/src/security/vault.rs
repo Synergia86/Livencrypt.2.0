@@ -1277,6 +1277,38 @@ fn boot_shield_unlock_impl(
     }
 }
 
+pub fn boot_shield_set_duress_key(
+    cajas: [i64; 5],
+    frase: String,
+    secondary_cajas: Option<[i64; 5]>,
+    secondary_frase: Option<String>,
+    duress_cajas: [i64; 5],
+    duress_frase: String,
+) -> Result<BootShieldStatus, String> {
+    if !vault_is_configured() {
+        return Err("Boot Shield no esta configurado.".into());
+    }
+
+    let envelope = read_envelope()?;
+    let secret = normalize_secret(cajas, frase)?;
+    let secondary_secret = normalize_secondary_secret(secondary_cajas, secondary_frase)?;
+    decrypt_payload(&envelope, &secret, secondary_secret.as_ref())?;
+
+    let duress_secret = normalize_secret(duress_cajas, duress_frase)?;
+    let mut defense_state = read_defense_state();
+    defense_state.failed_attempts = 0;
+    defense_state.duress_salt = random_bytes(32);
+    let mut duress_key = derive_key(
+        &duress_secret,
+        &defense_state.duress_salt,
+        &KdfParams::default(),
+    )?;
+    defense_state.duress_check = duress_key.to_vec();
+    duress_key.zeroize();
+    write_defense_state(&defense_state)?;
+    boot_shield_status()
+}
+
 pub fn boot_shield_lock() -> Result<BootShieldStatus, String> {
     let mut runtime = lock_runtime();
     runtime.payload = None;

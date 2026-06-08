@@ -243,7 +243,9 @@ fn parse_solana_payload(raw: &[u8]) -> Result<ParsedTx, String> {
     const SYSTEM_TRANSFER_DISCRIMINANT: [u8; 4] = [2, 0, 0, 0];
     const SOLANA_LAMPORTS_LIMIT: u64 = 100_000_000_000_000;
 
-    let first = *raw.first().ok_or_else(|| "mensaje Solana vacio".to_string())?;
+    let first = *raw
+        .first()
+        .ok_or_else(|| "mensaje Solana vacio".to_string())?;
     let mut reader = ByteReader::new(raw);
 
     if first & 0x80 != 0 {
@@ -305,7 +307,10 @@ fn parse_solana_payload(raw: &[u8]) -> Result<ParsedTx, String> {
         }
         let mut lamports_bytes = [0u8; 8];
         lamports_bytes.copy_from_slice(&data[4..12]);
-        transfer = Some((account_indexes[1] as usize, u64::from_le_bytes(lamports_bytes)));
+        transfer = Some((
+            account_indexes[1] as usize,
+            u64::from_le_bytes(lamports_bytes),
+        ));
     }
 
     let (to_index, lamports) =

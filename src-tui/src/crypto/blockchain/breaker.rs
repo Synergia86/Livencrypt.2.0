@@ -105,7 +105,7 @@ fn compute_rearm_verifier(cajas: [i64; 5], master_phrase: &str) -> Result<[u8; 3
     let mut key = derive_vault_key(cajas, master_phrase)?;
     let mut hasher = Sha256::new();
     hasher.update(b"LIVENCRYPT-BREAKER-REARM-V1");
-    hasher.update(&key);
+    hasher.update(key);
     key.zeroize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&hasher.finalize());
@@ -139,10 +139,7 @@ mod tests {
     #[test]
     fn rearm_rejects_wrong_credentials() {
         let mut breaker = frozen_breaker();
-        assert!(matches!(
-            breaker.state,
-            GatewaySecurityState::Frozen { .. }
-        ));
+        assert!(matches!(breaker.state, GatewaySecurityState::Frozen { .. }));
         // Frase incorrecta -> rechazo.
         assert!(breaker
             .resolve_and_reset([1, 2, 3, 4, 5], "frase incorrecta")
@@ -152,10 +149,7 @@ mod tests {
             .resolve_and_reset([9, 9, 9, 9, 9], "frase maestra de prueba")
             .is_err());
         // El estado sigue congelado tras intentos fallidos.
-        assert!(matches!(
-            breaker.state,
-            GatewaySecurityState::Frozen { .. }
-        ));
+        assert!(matches!(breaker.state, GatewaySecurityState::Frozen { .. }));
     }
 
     #[test]

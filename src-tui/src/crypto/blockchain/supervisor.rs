@@ -9,6 +9,7 @@ use crate::crypto::blockchain::proxy::{
     read_native_message, write_native_message, ExtensionRequest, ExtensionResponse,
 };
 use crate::crypto::blockchain::tx_parser::parse_tx_payload;
+use crate::crypto::blockchain::types::{SigningRequestPreview, TransactionSignRequest};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -162,6 +163,72 @@ impl GatewaySupervisor {
                 serde_json::to_vec(&response).map_err(|error| error.to_string())
             }
         }
+    }
+
+    pub fn preview_sign_transaction(
+        &mut self,
+        sign_request: &TransactionSignRequest,
+    ) -> Result<SigningRequestPreview, String> {
+        if crate::security::ai_monitor::current_risk_score()
+            >= crate::security::ai_monitor::CRITICAL_RISK_THRESHOLD
+        {
+            self.breaker.trigger_hard_lock();
+        }
+
+        if self.breaker.state == GatewaySecurityState::HardLocked {
+            return Err("acceso revocado: intervencion local requerida".to_string());
+        }
+
+        if matches!(self.breaker.state, GatewaySecurityState::Frozen { .. }) {
+            return Err("operacion suspendida temporalmente".to_string());
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let parsed = match parse_tx_payload(&sign_request.chain, &sign_request.raw_tx_payload) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let error = format!("no se pudo parsear payload: {}", error);
+                self.register_integrity_failure(&error, now);
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = self.firewall.validate_parsed_transaction(&parsed) {
+            self.register_integrity_failure(&error, now);
+            return Err(format!("violacion de perimetro: {}", error));
+        }
+
+        if let Err(error) = self
+            .firewall
+            .validate_target_destination_id(&parsed, sign_request.target_dex_cex_id.as_deref())
+        {
+            self.register_integrity_failure(&error, now);
+            return Err(format!("violacion de perimetro: {}", error));
+        }
+
+        let effective_volume_units = match self.firewall.effective_volume_units(&parsed) {
+            Ok(volume) => volume,
+            Err(error) => {
+                self.register_integrity_failure(&error, now);
+                return Err(error);
+            }
+        };
+
+        Ok(SigningRequestPreview {
+            request_id: 0,
+            chain: parsed.chain,
+            chain_id: parsed.chain_id,
+            account_index: sign_request.account_index,
+            address_index: sign_request.address_index,
+            method: parsed.method,
+            summary: parsed.summary,
+            target_dex_cex_id: sign_request.target_dex_cex_id.clone(),
+            value_usd: sign_request.value_usd,
+            effective_volume_units,
+        })
     }
 
     fn register_integrity_failure(&mut self, error: &str, now: u64) {

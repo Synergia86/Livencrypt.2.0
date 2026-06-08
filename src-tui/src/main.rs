@@ -14,6 +14,7 @@ use livencrypt_lib::crypto::blockchain::breaker::GatewaySecurityState;
 use livencrypt_lib::crypto::blockchain::firewall::{FirewallRules, LiveFirewall};
 use livencrypt_lib::crypto::blockchain::multi_curve::UniversalKeymaster;
 use livencrypt_lib::crypto::blockchain::supervisor::GatewaySupervisor;
+use livencrypt_lib::crypto::blockchain::types::{ChainType, SigningRequestPreview};
 use livencrypt_lib::crypto::blockchain::worker::{
     Web3BackgroundWorker, Web3WorkerCmd, Web3WorkerEvent,
 };
@@ -28,6 +29,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
+use sha3::{Digest, Keccak256};
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -53,6 +55,10 @@ const TEMPLATE_PREVIEW_CELL_WIDTH: usize = 6;
 const TEMPLATE_LIST_ROWS: usize = 10;
 const MIN_TERMINAL_WIDTH: u16 = 100;
 const MIN_TERMINAL_HEIGHT: u16 = 30;
+const CREDENTIAL_MODE_DOUBLE: &str = "double";
+const UNLOCK_SINGLE_FIELD_COUNT: usize = 6;
+const UNLOCK_DOUBLE_FIELD_COUNT: usize = 12;
+const SETTINGS_FIELD_COUNT: usize = 22;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = std::env::args().collect::<Vec<_>>();
@@ -392,6 +398,7 @@ enum Screen {
     RecoveryMode,
     InstallProfile,
     WalletGateway,
+    WalletAuditor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -421,6 +428,7 @@ enum FileBrowserTarget {
     Input,
     Output,
     TextExport,
+    SandboxPayload,
 }
 
 struct FileBrowser {
@@ -580,6 +588,9 @@ struct TuiState {
     screen: Screen,
     cajas: [String; 5],
     frase: String,
+    secondary_cajas: [String; 5],
+    secondary_frase: String,
+    boot_credential_mode: String,
     focus: usize,
     status: String,
     operation_log: Vec<String>,
@@ -646,12 +657,17 @@ struct TuiState {
 
     settings_boot_cajas: [String; 5],
     settings_boot_frase: String,
+    settings_boot_secondary_cajas: [String; 5],
+    settings_boot_secondary_frase: String,
+    settings_duress_cajas: [String; 5],
+    settings_duress_frase: String,
     settings_boot_template: String,
     settings_network_profile: String,
     settings_network_confirmation: String,
     inactivity_enabled: bool,
     inactivity_timeout_seconds: u64,
     settings_focus: usize,
+    settings_scroll: u16,
 
     web3_cmd_tx: Option<mpsc::Sender<Web3WorkerCmd>>,
     web3_event_rx: Option<mpsc::Receiver<Web3WorkerEvent>>,
@@ -661,6 +677,7 @@ struct TuiState {
     allowed_dex_contracts: Vec<String>,
     allowed_cex_destinations: Vec<String>,
     system_notification: String,
+    pending_signing_preview: Option<SigningRequestPreview>,
     gateway_focused_field: usize,
     input_max_tx: String,
     input_max_volume: String,
@@ -670,11 +687,27 @@ struct TuiState {
     reset_cajas: [String; 5],
     reset_phrase: String,
     reset_focus_index: usize,
+    auditor_chain_index: usize,
+    auditor_account_index: String,
+    auditor_address_index: String,
+    auditor_focus: usize,
+    auditor_public_key_hex: String,
+    auditor_address: String,
+    auditor_status: String,
+    sandbox_payload_path: String,
+    sandbox_memory_mib: String,
+    sandbox_cpu_seconds: String,
+    sandbox_file_size_mib: String,
+    sandbox_focus: usize,
+    sandbox_active_pids: Vec<i32>,
+    sandbox_selected_pid: usize,
+    sandbox_status: String,
 }
 
 impl TuiState {
     fn new() -> Self {
         let vault_configured = security::vault_is_configured();
+        let boot_credential_mode = current_boot_credential_mode();
         let templates = template_names();
         let mut state = Self {
             screen: if vault_configured {
@@ -684,6 +717,9 @@ impl TuiState {
             },
             cajas: empty_boxes(),
             frase: String::new(),
+            secondary_cajas: empty_boxes(),
+            secondary_frase: String::new(),
+            boot_credential_mode,
             focus: 0,
             status: if vault_configured {
                 "Boot Shield bloqueado. Introduzca 5 cajas + frase.".to_string()
@@ -752,6 +788,10 @@ impl TuiState {
             number_click_ready: false,
             settings_boot_cajas: default_boxes(),
             settings_boot_frase: String::new(),
+            settings_boot_secondary_cajas: empty_boxes(),
+            settings_boot_secondary_frase: String::new(),
+            settings_duress_cajas: empty_boxes(),
+            settings_duress_frase: String::new(),
             settings_boot_template: DEFAULT_TEMPLATE.to_string(),
             settings_network_profile: security::get_network_profile()
                 .unwrap_or_else(|_| "mock".to_string()),
@@ -759,6 +799,7 @@ impl TuiState {
             inactivity_enabled: false,
             inactivity_timeout_seconds: 300,
             settings_focus: 0,
+            settings_scroll: 0,
             web3_cmd_tx: None,
             web3_event_rx: None,
             cached_gateway_state: GatewaySecurityState::Frozen {
@@ -770,6 +811,7 @@ impl TuiState {
             allowed_dex_contracts: Vec::new(),
             allowed_cex_destinations: Vec::new(),
             system_notification: "Pasarela Web3 pendiente de desbloqueo Boot Shield.".to_string(),
+            pending_signing_preview: None,
             gateway_focused_field: 0,
             input_max_tx: "10".to_string(),
             input_max_volume: "5000".to_string(),
@@ -779,6 +821,21 @@ impl TuiState {
             reset_cajas: empty_boxes(),
             reset_phrase: String::new(),
             reset_focus_index: 0,
+            auditor_chain_index: 0,
+            auditor_account_index: "0".to_string(),
+            auditor_address_index: "0".to_string(),
+            auditor_focus: 0,
+            auditor_public_key_hex: String::new(),
+            auditor_address: String::new(),
+            auditor_status: "Seleccione red y pulse Enter para derivar.".to_string(),
+            sandbox_payload_path: String::new(),
+            sandbox_memory_mib: "512".to_string(),
+            sandbox_cpu_seconds: "120".to_string(),
+            sandbox_file_size_mib: "64".to_string(),
+            sandbox_focus: 0,
+            sandbox_active_pids: Vec::new(),
+            sandbox_selected_pid: 0,
+            sandbox_status: "Seleccione binario y pulse Enter para ejecutar en memfd.".to_string(),
         };
         state.refresh_templates_count();
         state.add_log("TUI inicializada.");
@@ -789,6 +846,9 @@ impl TuiState {
         zeroize_boxes(&mut self.cajas);
         self.frase.zeroize();
         self.frase.clear();
+        zeroize_boxes(&mut self.secondary_cajas);
+        self.secondary_frase.zeroize();
+        self.secondary_frase.clear();
         self.focus = 0;
     }
 
@@ -832,6 +892,7 @@ impl TuiState {
 
     fn refresh_integrity(&mut self) {
         self.integrity = security::vault::current_integrity_status();
+        self.boot_credential_mode = current_boot_credential_mode();
     }
 
     fn refresh_templates_count(&mut self) {
@@ -853,27 +914,75 @@ impl TuiState {
         parse_boxes(&self.cajas)
     }
 
+    fn unlock_requires_secondary(&self) -> bool {
+        self.boot_credential_mode == CREDENTIAL_MODE_DOUBLE
+    }
+
     fn unlock(&mut self) {
         let cajas = self.parse_unlock_cajas();
         let mut frase = String::new();
         std::mem::swap(&mut frase, &mut self.frase);
+        let secondary_required = self.unlock_requires_secondary();
+        let secondary_cajas = if secondary_required {
+            Some(match parse_boxes(&self.secondary_cajas) {
+                Ok(cajas) => cajas,
+                Err(error) => {
+                    frase.zeroize();
+                    self.clear_secret_fields();
+                    self.status = error;
+                    self.add_log("Intento de acceso rechazado.");
+                    return;
+                }
+            })
+        } else {
+            None
+        };
+        let mut secondary_frase = if secondary_required {
+            let mut value = String::new();
+            std::mem::swap(&mut value, &mut self.secondary_frase);
+            Some(value)
+        } else {
+            None
+        };
 
         let result = match cajas {
             Ok(cajas) if !frase.trim().is_empty() => {
-                let mut frase_for_gateway = frase.clone();
-                let unlock_result = security::vault::boot_shield_unlock(cajas, frase, None, None)
+                if secondary_required
+                    && secondary_frase
+                        .as_ref()
+                        .is_none_or(|value| value.trim().is_empty())
+                {
+                    frase.zeroize();
+                    if let Some(value) = secondary_frase.as_mut() {
+                        value.zeroize();
+                    }
+                    Err(INVALID_ACCESS.to_string())
+                } else {
+                    let mut frase_for_gateway = frase.clone();
+                    let unlock_result = security::vault::boot_shield_unlock(
+                        cajas,
+                        frase,
+                        secondary_cajas,
+                        secondary_frase.take(),
+                    )
                     .map(|_| ())
                     .map_err(|_| INVALID_ACCESS.to_string());
-                if unlock_result.is_ok() {
-                    if let Err(error) = self.initialize_wallet_gateway(cajas, &frase_for_gateway) {
-                        self.system_notification = format!("Web3 no inicializado: {}", error);
+                    if unlock_result.is_ok() {
+                        if let Err(error) =
+                            self.initialize_wallet_gateway(cajas, &frase_for_gateway)
+                        {
+                            self.system_notification = format!("Web3 no inicializado: {}", error);
+                        }
                     }
+                    frase_for_gateway.zeroize();
+                    unlock_result
                 }
-                frase_for_gateway.zeroize();
-                unlock_result
             }
             Ok(_) | Err(_) => {
                 frase.zeroize();
+                if let Some(value) = secondary_frase.as_mut() {
+                    value.zeroize();
+                }
                 Err(INVALID_ACCESS.to_string())
             }
         };
@@ -901,6 +1010,12 @@ impl TuiState {
         self.clear_file_fields();
         self.settings_boot_frase.zeroize();
         self.settings_boot_frase.clear();
+        zeroize_boxes(&mut self.settings_boot_secondary_cajas);
+        self.settings_boot_secondary_frase.zeroize();
+        self.settings_boot_secondary_frase.clear();
+        zeroize_boxes(&mut self.settings_duress_cajas);
+        self.settings_duress_frase.zeroize();
+        self.settings_duress_frase.clear();
         self.screen = if security::vault_is_configured() {
             Screen::Unlock
         } else {
@@ -956,6 +1071,7 @@ impl TuiState {
         self.cached_tx_count = 0;
         self.cached_volume_units = Decimal::ZERO;
         self.system_notification = "Pasarela Web3 detenida.".to_string();
+        self.pending_signing_preview = None;
         self.show_breaker_reset = false;
         self.clear_gateway_secret_fields();
     }
@@ -970,12 +1086,10 @@ impl TuiState {
         let Some(value) = self.teclado_shuffled.get(self.cursor_teclado).copied() else {
             return;
         };
-        if self.focus < 5 {
-            if value.is_ascii_digit() || (value == '-' && self.cajas[self.focus].is_empty()) {
-                self.cajas[self.focus].push(value);
-            }
+        if matches!(self.focus, 0..=4 | 6..=10) {
+            let _ = push_unlock_box_char(self, value);
         } else {
-            self.frase.push(value);
+            push_unlock_phrase_char(self, value);
         }
     }
 
@@ -1010,17 +1124,26 @@ impl Drop for TuiState {
         zeroize_boxes(&mut self.text_cajas);
         zeroize_boxes(&mut self.file_cajas);
         zeroize_boxes(&mut self.settings_boot_cajas);
+        zeroize_boxes(&mut self.settings_boot_secondary_cajas);
+        zeroize_boxes(&mut self.settings_duress_cajas);
         self.file_browser.clear();
         self.status.zeroize();
         self.recovery_path.zeroize();
         self.recovery_error.zeroize();
         self.settings_boot_frase.zeroize();
+        self.settings_boot_secondary_frase.zeroize();
+        self.settings_duress_frase.zeroize();
         self.settings_network_confirmation.zeroize();
         self.text_output_file.zeroize();
         self.shutdown_wallet_gateway();
         self.input_new_dex_id.zeroize();
         self.input_new_cex_id.zeroize();
         self.system_notification.zeroize();
+        self.auditor_public_key_hex.zeroize();
+        self.auditor_address.zeroize();
+        self.auditor_status.zeroize();
+        self.sandbox_payload_path.zeroize();
+        self.sandbox_status.zeroize();
     }
 }
 
@@ -1042,6 +1165,54 @@ fn zeroize_boxes(boxes: &mut [String; 5]) {
     for value in boxes {
         value.zeroize();
         value.clear();
+    }
+}
+
+fn current_boot_credential_mode() -> String {
+    security::vault::boot_shield_status()
+        .map(|status| status.credential_mode)
+        .unwrap_or_else(|_| "single".to_string())
+}
+
+fn unlock_field_count(state: &TuiState) -> usize {
+    if state.unlock_requires_secondary() {
+        UNLOCK_DOUBLE_FIELD_COUNT
+    } else {
+        UNLOCK_SINGLE_FIELD_COUNT
+    }
+}
+
+fn push_unlock_box_char(state: &mut TuiState, value: char) -> bool {
+    match state.focus {
+        0..=4 => push_box_char(&mut state.cajas[state.focus], value),
+        6..=10 => push_box_char(&mut state.secondary_cajas[state.focus - 6], value),
+        _ => false,
+    }
+}
+
+fn push_unlock_phrase_char(state: &mut TuiState, value: char) {
+    match state.focus {
+        5 => state.frase.push(value),
+        11 => state.secondary_frase.push(value),
+        _ => {}
+    }
+}
+
+fn pop_unlock_field(state: &mut TuiState) {
+    match state.focus {
+        0..=4 => {
+            state.cajas[state.focus].pop();
+        }
+        5 => {
+            state.frase.pop();
+        }
+        6..=10 => {
+            state.secondary_cajas[state.focus - 6].pop();
+        }
+        11 => {
+            state.secondary_frase.pop();
+        }
+        _ => {}
     }
 }
 
@@ -1182,6 +1353,57 @@ fn gateway_state_label(state: &GatewaySecurityState) -> &'static str {
     }
 }
 
+fn auditor_chains() -> [ChainType; 3] {
+    [ChainType::Bitcoin, ChainType::Ethereum, ChainType::Solana]
+}
+
+fn selected_auditor_chain(state: &TuiState) -> ChainType {
+    auditor_chains()
+        .get(state.auditor_chain_index)
+        .cloned()
+        .unwrap_or(ChainType::Bitcoin)
+}
+
+fn parse_auditor_index(value: &str) -> Result<u32, String> {
+    value
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "Indice de auditor invalido.".to_string())
+}
+
+fn increment_numeric_string(value: &mut String) {
+    let current = value.trim().parse::<u32>().unwrap_or(0);
+    *value = current.saturating_add(1).to_string();
+}
+
+fn decrement_numeric_string(value: &mut String) {
+    let current = value.trim().parse::<u32>().unwrap_or(0);
+    *value = current.saturating_sub(1).to_string();
+}
+
+fn public_key_address_label(chain: &ChainType, public_key: &[u8]) -> String {
+    match chain {
+        ChainType::Ethereum if public_key.len() == 64 => {
+            let hash = Keccak256::digest(public_key);
+            format!("0x{}", hex::encode(&hash[12..]))
+        }
+        ChainType::Solana if public_key.len() == 32 => bs58::encode(public_key).into_string(),
+        ChainType::Bitcoin => format!(
+            "btc-pubkey:{}",
+            truncate_chars(&hex::encode(public_key), 72)
+        ),
+        ChainType::Ethereum => format!(
+            "eth-pubkey:{}",
+            truncate_chars(&hex::encode(public_key), 72)
+        ),
+        ChainType::Solana => format!(
+            "sol-pubkey:{}",
+            truncate_chars(&hex::encode(public_key), 72)
+        ),
+        ChainType::Monero => "Monero no soportado en auditor TUI.".to_string(),
+    }
+}
+
 fn shuffled_keyboard() -> Vec<char> {
     let mut chars: Vec<char> = "0123456789ABCDEFabcdef!@#$%^&*()-_=+[]{};:,.?/"
         .chars()
@@ -1207,7 +1429,11 @@ fn shuffled_template_keyboard(template_name: &str) -> Vec<String> {
     values
 }
 
-fn run_app<B: Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+fn run_app<B>(terminal: &mut Terminal<B>) -> io::Result<()>
+where
+    B: Backend,
+    io::Error: From<B::Error>,
+{
     let mut state = TuiState::new();
     let mut last_interaction = Instant::now();
 
@@ -1333,6 +1559,37 @@ fn process_background_web3_events(state: &mut TuiState) {
                     state.input_max_volume = rules.max_daily_volume_units.to_string();
                 }
             }
+            Ok(Web3WorkerEvent::SigningRequest(preview)) => {
+                state.pending_signing_preview = Some(preview);
+                state.screen = Screen::WalletGateway;
+                state.status = "Firma Web3 pendiente de autorizacion local.".to_string();
+            }
+            Ok(Web3WorkerEvent::PublicKeyDerived {
+                chain,
+                account_index,
+                address_index,
+                result,
+            }) => match result {
+                Ok(public_key) => {
+                    state.auditor_public_key_hex = hex::encode(&public_key);
+                    state.auditor_address = public_key_address_label(&chain, &public_key);
+                    state.auditor_status = format!(
+                        "Derivacion OK: {:?} cuenta {} indice {}.",
+                        chain, account_index, address_index
+                    );
+                    state.add_log(format!(
+                        "Auditor Web3: {:?} cuenta {} indice {} derivado.",
+                        chain, account_index, address_index
+                    ));
+                }
+                Err(error) => {
+                    state.auditor_public_key_hex.zeroize();
+                    state.auditor_public_key_hex.clear();
+                    state.auditor_address.zeroize();
+                    state.auditor_address.clear();
+                    state.auditor_status = format!("Error derivando clave publica: {}", error);
+                }
+            },
             Ok(Web3WorkerEvent::Notification(message)) => {
                 state.system_notification = message;
             }
@@ -1360,6 +1617,10 @@ fn close_forensic_report(state: &mut TuiState) {
 }
 
 fn handle_key(state: &mut TuiState, key: KeyEvent) {
+    if state.pending_signing_preview.is_some() {
+        handle_signing_authorization_key(state, key);
+        return;
+    }
     if state.show_file_browser {
         handle_file_browser_key(state, key);
         return;
@@ -1394,10 +1655,11 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         Screen::SystemMonitor => handle_system_monitor_key(state, key),
         Screen::AuditMonitor => handle_back_to_dashboard_key(state, key),
         Screen::FirmwareStaging => handle_firmware_staging_key(state, key),
-        Screen::SandboxManager => handle_back_to_dashboard_key(state, key),
+        Screen::SandboxManager => handle_sandbox_manager_key(state, key),
         Screen::RecoveryMode => handle_recovery_key(state, key),
         Screen::InstallProfile => handle_back_to_dashboard_key(state, key),
         Screen::WalletGateway => handle_wallet_gateway_key(state, key),
+        Screen::WalletAuditor => handle_wallet_auditor_key(state, key),
     }
 }
 
@@ -1414,6 +1676,18 @@ fn handle_paste_event(state: &mut TuiState, text: String) {
 }
 
 fn handle_mouse_event(state: &mut TuiState, mouse: MouseEvent) {
+    if state.pending_signing_preview.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let area = terminal_area();
+            let inner = centered_area(area, 94, 88);
+            let popup = centered_area(inner, 78, 56);
+            if point_in_rect(mouse.column, mouse.row, popup) {
+                let approve = mouse.column < popup.x + popup.width / 2;
+                submit_signing_authorization(state, approve);
+            }
+        }
+        return;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => handle_mouse_scroll(state, true),
         MouseEventKind::ScrollDown => handle_mouse_scroll(state, false),
@@ -1489,6 +1763,13 @@ fn handle_mouse_scroll(state: &mut TuiState, up: bool) {
                 }
             }
         }
+        Screen::Settings => {
+            if up {
+                state.settings_scroll = state.settings_scroll.saturating_sub(1);
+            } else {
+                state.settings_scroll = state.settings_scroll.saturating_add(1).min(24);
+            }
+        }
         _ => {}
     }
 }
@@ -1525,14 +1806,15 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         Screen::SystemMonitor
         | Screen::AuditMonitor
         | Screen::FirmwareStaging
-        | Screen::SandboxManager
         | Screen::RecoveryMode
         | Screen::InstallProfile => {
             if mouse.row <= inner.y + 1 {
                 state.screen = Screen::Dashboard;
             }
         }
+        Screen::SandboxManager => handle_sandbox_manager_mouse(state, mouse, inner),
         Screen::WalletGateway => handle_wallet_gateway_mouse(state, mouse, inner),
+        Screen::WalletAuditor => handle_wallet_auditor_mouse(state, mouse, inner),
     }
 }
 
@@ -1555,10 +1837,15 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 
 fn handle_unlock_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     let hardening = security::process_hardening::process_hardening_status();
+    let form_height = if state.unlock_requires_secondary() {
+        15
+    } else {
+        10
+    };
     let constraints = if hardening.warnings.is_empty() {
         vec![
             Constraint::Length(4),
-            Constraint::Length(10),
+            Constraint::Length(form_height),
             Constraint::Length(8),
             Constraint::Min(4),
         ]
@@ -1566,7 +1853,7 @@ fn handle_unlock_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
         vec![
             Constraint::Length(4),
             Constraint::Length(3),
-            Constraint::Length(10),
+            Constraint::Length(form_height),
             Constraint::Length(8),
             Constraint::Min(4),
         ]
@@ -1581,8 +1868,15 @@ fn handle_unlock_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     let form = chunks[form_index];
     if point_in_rect(mouse.column, mouse.row, form) {
         let offset = mouse.row.saturating_sub(form.y + 1);
-        if offset < 6 {
-            state.focus = offset as usize;
+        let selected = match offset {
+            1..=5 => Some((offset - 1) as usize),
+            6 => Some(5),
+            9..=13 if state.unlock_requires_secondary() => Some((offset - 3) as usize),
+            14 if state.unlock_requires_secondary() => Some(11),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            state.focus = selected.min(unlock_field_count(state).saturating_sub(1));
         }
         return;
     }
@@ -1604,7 +1898,7 @@ fn handle_dashboard_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
-            Constraint::Length(16),
+            Constraint::Length(17),
             Constraint::Min(4),
         ])
         .split(area);
@@ -1614,21 +1908,22 @@ fn handle_dashboard_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     }
     match mouse.row.saturating_sub(list.y + 1) {
         3 => state.screen = Screen::WalletGateway,
-        4 => state.screen = Screen::TextCipher,
-        5 => state.screen = Screen::FileCipher,
-        6 => state.screen = Screen::TemplateEditor,
-        7 => state.screen = Screen::Settings,
-        8 => {
+        4 => state.screen = Screen::WalletAuditor,
+        5 => state.screen = Screen::TextCipher,
+        6 => state.screen = Screen::FileCipher,
+        7 => state.screen = Screen::TemplateEditor,
+        8 => state.screen = Screen::Settings,
+        9 => {
             state.refresh_integrity();
             state.screen = Screen::SystemMonitor;
         }
-        9 => state.screen = Screen::AuditMonitor,
-        10 => state.screen = Screen::FirmwareStaging,
-        11 => state.screen = Screen::SandboxManager,
-        12 => state.screen = Screen::RecoveryMode,
-        13 => state.screen = Screen::InstallProfile,
-        14 => state.lock(),
-        15 => {
+        10 => state.screen = Screen::AuditMonitor,
+        11 => state.screen = Screen::FirmwareStaging,
+        12 => state.screen = Screen::SandboxManager,
+        13 => state.screen = Screen::RecoveryMode,
+        14 => state.screen = Screen::InstallProfile,
+        15 => state.lock(),
+        16 => {
             let _ = security::vault::boot_shield_hardened_lock();
             state.should_quit = true;
         }
@@ -1760,7 +2055,11 @@ fn handle_file_cipher_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect)
     if !point_in_rect(mouse.column, mouse.row, chunks[0]) {
         return;
     }
-    match mouse.row.saturating_sub(chunks[0].y + 1) {
+    let row = mouse
+        .row
+        .saturating_sub(chunks[0].y + 1)
+        .saturating_add(state.settings_scroll);
+    match row {
         0 => {
             if mouse.column < chunks[0].x + 24 {
                 open_file_browser(state);
@@ -1953,11 +2252,15 @@ fn handle_settings_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
         3..=7 => state.settings_focus = mouse.row.saturating_sub(chunks[0].y + 4) as usize,
         8 => state.settings_focus = 5,
         9 => state.settings_focus = 6,
-        10 => state.settings_focus = 9,
-        13 => state.settings_focus = 7,
-        14 => state.settings_focus = 8,
+        11..=15 => state.settings_focus = mouse.row.saturating_sub(chunks[0].y + 5) as usize,
+        16 => state.settings_focus = 12,
+        20..=24 => state.settings_focus = mouse.row.saturating_sub(chunks[0].y + 7) as usize,
+        25 => state.settings_focus = 18,
+        27 => state.settings_focus = 21,
+        30 => state.settings_focus = 19,
+        31 => state.settings_focus = 20,
         0 => {}
-        row if row >= 22 => {
+        row if row >= 38 => {
             if mouse.column < chunks[0].x + chunks[0].width / 2 {
                 enable_apparmor_from_settings(state);
             } else {
@@ -1969,20 +2272,21 @@ fn handle_settings_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
 }
 
 fn handle_unlock_key(state: &mut TuiState, key: KeyEvent) {
+    let field_count = unlock_field_count(state);
     match key.code {
         KeyCode::Esc => {
             state.clear_secret_fields();
             state.should_quit = true;
         }
-        KeyCode::Tab => state.focus = (state.focus + 1) % 6,
-        KeyCode::BackTab => state.focus = if state.focus == 0 { 5 } else { state.focus - 1 },
-        KeyCode::Backspace => {
-            if state.focus < 5 {
-                state.cajas[state.focus].pop();
+        KeyCode::Tab => state.focus = (state.focus + 1) % field_count,
+        KeyCode::BackTab => {
+            state.focus = if state.focus == 0 {
+                field_count - 1
             } else {
-                state.frase.pop();
+                state.focus - 1
             }
         }
+        KeyCode::Backspace => pop_unlock_field(state),
         KeyCode::Left => state.cursor_teclado = state.cursor_teclado.saturating_sub(1),
         KeyCode::Right => {
             if state.cursor_teclado + 1 < state.teclado_shuffled.len() {
@@ -2001,7 +2305,7 @@ fn handle_unlock_key(state: &mut TuiState, key: KeyEvent) {
         }
         KeyCode::Char(' ') => state.insert_virtual_char(),
         KeyCode::Enter => {
-            if state.focus < 5 {
+            if state.focus + 1 < field_count {
                 state.focus += 1;
             } else {
                 state.unlock();
@@ -2009,12 +2313,12 @@ fn handle_unlock_key(state: &mut TuiState, key: KeyEvent) {
         }
         KeyCode::F(10) => state.unlock(),
         KeyCode::Char(value) => {
-            if state.focus < 5 {
-                if !push_box_char(&mut state.cajas[state.focus], value) {
+            if matches!(state.focus, 0..=4 | 6..=10) {
+                if !push_unlock_box_char(state, value) {
                     state.status = "Caja fuera de rango permitido (-999..999).".to_string();
                 }
             } else {
-                state.frase.push(value);
+                push_unlock_phrase_char(state, value);
             }
         }
         _ => {}
@@ -2056,6 +2360,7 @@ fn handle_dashboard_key(state: &mut TuiState, key: KeyEvent) {
         }
         KeyCode::Char('p') => state.screen = Screen::InstallProfile,
         KeyCode::Char('w') | KeyCode::Char('W') => state.screen = Screen::WalletGateway,
+        KeyCode::Char('k') | KeyCode::Char('K') => state.screen = Screen::WalletAuditor,
         KeyCode::Char('l') => state.lock(),
         KeyCode::Char('R') => {
             state.refresh_templates_count();
@@ -2070,6 +2375,330 @@ fn handle_back_to_dashboard_key(state: &mut TuiState, key: KeyEvent) {
         KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
         _ => {}
     }
+}
+
+fn submit_wallet_auditor_derivation(state: &mut TuiState) {
+    let Ok(account_index) = parse_auditor_index(&state.auditor_account_index) else {
+        state.auditor_status = "Cuenta invalida: use un entero sin signo.".to_string();
+        return;
+    };
+    let Ok(address_index) = parse_auditor_index(&state.auditor_address_index) else {
+        state.auditor_status = "Indice invalido: use un entero sin signo.".to_string();
+        return;
+    };
+    let chain = selected_auditor_chain(state);
+
+    if let Some(tx) = &state.web3_cmd_tx {
+        let result = tx.send(Web3WorkerCmd::DerivePublicKey {
+            chain: chain.clone(),
+            account_index,
+            address_index,
+        });
+        if result.is_ok() {
+            state.auditor_status = format!(
+                "Solicitada derivacion {:?} cuenta {} indice {}.",
+                chain, account_index, address_index
+            );
+        } else {
+            state.auditor_status = "Web3 no acepta solicitudes en este momento.".to_string();
+        }
+    } else {
+        state.auditor_status =
+            "Web3 no inicializado: desbloquee Boot Shield o configure el vault.".to_string();
+    }
+}
+
+fn cycle_wallet_auditor_chain(state: &mut TuiState, forward: bool) {
+    let count = auditor_chains().len();
+    if forward {
+        state.auditor_chain_index = (state.auditor_chain_index + 1) % count;
+    } else if state.auditor_chain_index == 0 {
+        state.auditor_chain_index = count - 1;
+    } else {
+        state.auditor_chain_index -= 1;
+    }
+    state.auditor_status = format!("Red seleccionada: {:?}.", selected_auditor_chain(state));
+}
+
+fn edit_wallet_auditor_number(target: &mut String, value: char) {
+    if value.is_ascii_digit() && target.len() < 10 {
+        target.push(value);
+    }
+}
+
+fn handle_wallet_auditor_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
+        KeyCode::Tab => state.auditor_focus = (state.auditor_focus + 1) % 3,
+        KeyCode::BackTab => {
+            state.auditor_focus = if state.auditor_focus == 0 {
+                2
+            } else {
+                state.auditor_focus - 1
+            };
+        }
+        KeyCode::Left => {
+            if state.auditor_focus == 0 {
+                cycle_wallet_auditor_chain(state, false);
+            }
+        }
+        KeyCode::Right => {
+            if state.auditor_focus == 0 {
+                cycle_wallet_auditor_chain(state, true);
+            }
+        }
+        KeyCode::Char('-') => match state.auditor_focus {
+            1 => decrement_numeric_string(&mut state.auditor_account_index),
+            2 => decrement_numeric_string(&mut state.auditor_address_index),
+            _ => {}
+        },
+        KeyCode::Char('+') => match state.auditor_focus {
+            1 => increment_numeric_string(&mut state.auditor_account_index),
+            2 => increment_numeric_string(&mut state.auditor_address_index),
+            _ => {}
+        },
+        KeyCode::Backspace => match state.auditor_focus {
+            1 => {
+                state.auditor_account_index.pop();
+            }
+            2 => {
+                state.auditor_address_index.pop();
+            }
+            _ => {}
+        },
+        KeyCode::Enter => submit_wallet_auditor_derivation(state),
+        KeyCode::Char(value) => match state.auditor_focus {
+            0 => match value {
+                '[' => cycle_wallet_auditor_chain(state, false),
+                ']' => cycle_wallet_auditor_chain(state, true),
+                _ => {}
+            },
+            1 => edit_wallet_auditor_number(&mut state.auditor_account_index, value),
+            2 => edit_wallet_auditor_number(&mut state.auditor_address_index, value),
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn handle_wallet_auditor_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    if point_in_rect(mouse.column, mouse.row, chunks[3]) {
+        if mouse.column < chunks[3].x + chunks[3].width / 2 {
+            submit_wallet_auditor_derivation(state);
+        } else {
+            state.screen = Screen::Dashboard;
+        }
+        return;
+    }
+    if point_in_rect(mouse.column, mouse.row, chunks[1]) {
+        match mouse.row.saturating_sub(chunks[1].y + 1) {
+            0 => {
+                state.auditor_focus = 0;
+                cycle_wallet_auditor_chain(state, true);
+            }
+            1 => state.auditor_focus = 1,
+            2 => state.auditor_focus = 2,
+            _ => {}
+        }
+    }
+}
+
+fn parse_sandbox_limits(state: &TuiState) -> Result<security::sandbox::SandboxLimits, String> {
+    let memory_mib = state
+        .sandbox_memory_mib
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "Memoria sandbox invalida.".to_string())?
+        .clamp(16, 8192);
+    let cpu_seconds = state
+        .sandbox_cpu_seconds
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "CPU sandbox invalida.".to_string())?
+        .clamp(1, 3600);
+    let file_size_mib = state
+        .sandbox_file_size_mib
+        .trim()
+        .parse::<u64>()
+        .map_err(|_| "Limite de archivo sandbox invalido.".to_string())?
+        .clamp(1, 4096);
+    Ok(security::sandbox::SandboxLimits {
+        memory_mib,
+        cpu_seconds,
+        file_size_mib,
+    })
+}
+
+fn launch_sandbox_payload(state: &mut TuiState) {
+    let path = PathBuf::from(state.sandbox_payload_path.trim());
+    if path.as_os_str().is_empty() {
+        state.sandbox_status = "Seleccione un binario para el sandbox.".to_string();
+        return;
+    }
+    let limits = match parse_sandbox_limits(state) {
+        Ok(limits) => limits,
+        Err(error) => {
+            state.sandbox_status = error;
+            return;
+        }
+    };
+    let mut binary_data = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            state.sandbox_status = format!("No se pudo leer payload: {}", error);
+            return;
+        }
+    };
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("livencrypt-sandbox");
+    match security::loader::load_and_execute_in_ram_with_limits(name, &mut binary_data, limits) {
+        Ok(pid) => {
+            state.sandbox_active_pids.push(pid);
+            state.sandbox_selected_pid = state.sandbox_active_pids.len().saturating_sub(1);
+            state.sandbox_status = format!("Payload lanzado en memfd con PID {}.", pid);
+            state.add_log(format!("Sandbox memfd lanzado: PID {}", pid));
+        }
+        Err(error) => {
+            binary_data.zeroize();
+            state.sandbox_status = format!("No se pudo lanzar sandbox: {}", error);
+        }
+    }
+}
+
+fn terminate_selected_sandbox(state: &mut TuiState) {
+    let Some(pid) = state
+        .sandbox_active_pids
+        .get(state.sandbox_selected_pid)
+        .copied()
+    else {
+        state.sandbox_status = "No hay PID sandbox seleccionado.".to_string();
+        return;
+    };
+    security::sandbox::terminate_sandbox(pid, "operador_tui");
+    state.sandbox_active_pids.remove(state.sandbox_selected_pid);
+    state.sandbox_selected_pid = state
+        .sandbox_selected_pid
+        .min(state.sandbox_active_pids.len().saturating_sub(1));
+    state.sandbox_status = format!("SIGKILL enviado al PID {}.", pid);
+}
+
+fn active_sandbox_field_mut(state: &mut TuiState) -> &mut String {
+    match state.sandbox_focus {
+        0 => &mut state.sandbox_payload_path,
+        1 => &mut state.sandbox_memory_mib,
+        2 => &mut state.sandbox_cpu_seconds,
+        3 => &mut state.sandbox_file_size_mib,
+        _ => &mut state.sandbox_payload_path,
+    }
+}
+
+fn handle_sandbox_manager_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
+        KeyCode::Tab => state.sandbox_focus = (state.sandbox_focus + 1) % 4,
+        KeyCode::BackTab => {
+            state.sandbox_focus = if state.sandbox_focus == 0 {
+                3
+            } else {
+                state.sandbox_focus - 1
+            };
+        }
+        KeyCode::Char('B') | KeyCode::Char('b') => open_file_browser(state),
+        KeyCode::Enter => launch_sandbox_payload(state),
+        KeyCode::Char('K') | KeyCode::Char('k') => terminate_selected_sandbox(state),
+        KeyCode::Up => {
+            state.sandbox_selected_pid = state.sandbox_selected_pid.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if state.sandbox_selected_pid + 1 < state.sandbox_active_pids.len() {
+                state.sandbox_selected_pid += 1;
+            }
+        }
+        KeyCode::Backspace => {
+            active_sandbox_field_mut(state).pop();
+        }
+        KeyCode::Char(value) => {
+            if state.sandbox_focus == 0 {
+                state.sandbox_payload_path.push(value);
+            } else if value.is_ascii_digit() {
+                active_sandbox_field_mut(state).push(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_sandbox_manager_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
+    if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(10), Constraint::Length(7)])
+        .split(area);
+    if point_in_rect(mouse.column, mouse.row, chunks[0]) {
+        let row = mouse.row.saturating_sub(chunks[0].y + 1);
+        match row {
+            1 => state.sandbox_focus = 0,
+            2 => state.sandbox_focus = 1,
+            3 => state.sandbox_focus = 2,
+            4 => state.sandbox_focus = 3,
+            6 => launch_sandbox_payload(state),
+            7 => open_file_browser(state),
+            _ => {}
+        }
+    } else if point_in_rect(mouse.column, mouse.row, chunks[1]) {
+        let index = mouse.row.saturating_sub(chunks[1].y + 1) as usize;
+        if index < state.sandbox_active_pids.len() {
+            state.sandbox_selected_pid = index;
+        }
+    }
+}
+
+fn handle_signing_authorization_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::F(10) | KeyCode::Char('A') | KeyCode::Char('a') => {
+            submit_signing_authorization(state, true);
+        }
+        KeyCode::Esc | KeyCode::Char('D') | KeyCode::Char('d') => {
+            submit_signing_authorization(state, false);
+        }
+        _ => {
+            state.status = "Firma pendiente: F10/A autoriza, Esc/D rechaza.".to_string();
+        }
+    }
+}
+
+fn submit_signing_authorization(state: &mut TuiState, approve: bool) {
+    let Some(preview) = state.pending_signing_preview.take() else {
+        return;
+    };
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::AuthorizeSigning {
+            request_id: preview.request_id,
+            approve,
+        });
+    }
+    state.status = if approve {
+        "Firma Web3 autorizada; procesando en backend.".to_string()
+    } else {
+        "Firma Web3 rechazada por operador.".to_string()
+    };
 }
 
 fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
@@ -2323,6 +2952,8 @@ fn handle_text_cipher_key(state: &mut TuiState, key: KeyEvent) {
 fn open_file_browser(state: &mut TuiState) {
     state.file_browser_target = if state.screen == Screen::TextCipher {
         FileBrowserTarget::TextExport
+    } else if state.screen == Screen::SandboxManager {
+        FileBrowserTarget::SandboxPayload
     } else if state.focus == 1 {
         FileBrowserTarget::Output
     } else {
@@ -2350,6 +2981,9 @@ fn select_browser_path(state: &mut TuiState, path: PathBuf) {
         }
         FileBrowserTarget::TextExport => {
             state.text_output_file = path.display().to_string();
+        }
+        FileBrowserTarget::SandboxPayload => {
+            state.sandbox_payload_path = path.display().to_string();
         }
     }
     state.show_file_browser = false;
@@ -3735,13 +4369,17 @@ fn append_unique_until_limit(target: &mut Vec<String>, values: Vec<String>, limi
 fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => state.screen = Screen::Dashboard,
-        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % 10,
+        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % SETTINGS_FIELD_COUNT,
         KeyCode::BackTab => {
             state.settings_focus = if state.settings_focus == 0 {
-                9
+                SETTINGS_FIELD_COUNT - 1
             } else {
                 state.settings_focus - 1
             };
+        }
+        KeyCode::PageUp => state.settings_scroll = state.settings_scroll.saturating_sub(4),
+        KeyCode::PageDown => {
+            state.settings_scroll = state.settings_scroll.saturating_add(4).min(24);
         }
         KeyCode::Backspace => active_settings_field_mut(state)
             .pop()
@@ -3771,11 +4409,18 @@ fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
         KeyCode::Char('S') => save_network_profile_setting(state),
         KeyCode::Char('B') => enable_boot_shield_from_settings(state),
         KeyCode::Char('O') => disable_boot_shield_from_settings(state),
+        KeyCode::Char('D') => set_duress_key_from_settings(state),
         KeyCode::Char('P') => enable_apparmor_from_settings(state),
         KeyCode::Char('U') => disable_apparmor_from_settings(state),
         KeyCode::Char(value) => {
-            if state.settings_focus <= 4 {
-                if !push_box_char(&mut state.settings_boot_cajas[state.settings_focus], value) {
+            if matches!(state.settings_focus, 0..=4 | 7..=11 | 13..=17) {
+                let target = match state.settings_focus {
+                    0..=4 => &mut state.settings_boot_cajas[state.settings_focus],
+                    7..=11 => &mut state.settings_boot_secondary_cajas[state.settings_focus - 7],
+                    13..=17 => &mut state.settings_duress_cajas[state.settings_focus - 13],
+                    _ => unreachable!(),
+                };
+                if !push_box_char(target, value) {
                     state.status = "Caja fuera de rango permitido (-999..999).".to_string();
                 }
             } else {
@@ -3791,8 +4436,12 @@ fn active_settings_field_mut(state: &mut TuiState) -> &mut String {
         0..=4 => &mut state.settings_boot_cajas[state.settings_focus],
         5 => &mut state.settings_boot_frase,
         6 => &mut state.settings_boot_template,
-        7 => &mut state.settings_network_profile,
-        8 => &mut state.settings_network_confirmation,
+        7..=11 => &mut state.settings_boot_secondary_cajas[state.settings_focus - 7],
+        12 => &mut state.settings_boot_secondary_frase,
+        13..=17 => &mut state.settings_duress_cajas[state.settings_focus - 13],
+        18 => &mut state.settings_duress_frase,
+        19 => &mut state.settings_network_profile,
+        20 => &mut state.settings_network_confirmation,
         _ => &mut state.settings_network_confirmation,
     }
 }
@@ -3811,6 +4460,39 @@ fn save_network_profile_setting(state: &mut TuiState) {
         }
         Err(error) => state.status = format!("No se pudo guardar perfil de red: {}", error),
     }
+}
+
+fn secondary_settings_credentials(
+    state: &mut TuiState,
+) -> Result<(Option<[i64; 5]>, Option<String>), String> {
+    let boxes_empty = state
+        .settings_boot_secondary_cajas
+        .iter()
+        .all(|value| value.trim().is_empty());
+    let phrase_empty = state.settings_boot_secondary_frase.trim().is_empty();
+
+    if boxes_empty && phrase_empty {
+        return Ok((None, None));
+    }
+    if boxes_empty || phrase_empty {
+        return Err("La credencial secundaria requiere 5 cajas y frase B.".to_string());
+    }
+
+    let cajas = parse_boxes(&state.settings_boot_secondary_cajas)?;
+    let mut frase = String::new();
+    std::mem::swap(&mut frase, &mut state.settings_boot_secondary_frase);
+    Ok((Some(cajas), Some(frase)))
+}
+
+fn duress_settings_credentials(state: &mut TuiState) -> Result<([i64; 5], String), String> {
+    let cajas = parse_boxes(&state.settings_duress_cajas)?;
+    let mut frase = String::new();
+    std::mem::swap(&mut frase, &mut state.settings_duress_frase);
+    if frase.trim().is_empty() {
+        frase.zeroize();
+        return Err("La frase de coaccion no puede estar vacia.".to_string());
+    }
+    Ok((cajas, frase))
 }
 
 fn enable_apparmor_from_settings(state: &mut TuiState) {
@@ -3836,6 +4518,65 @@ fn disable_apparmor_from_settings(state: &mut TuiState) {
     }
 }
 
+fn set_duress_key_from_settings(state: &mut TuiState) {
+    let cajas = match parse_boxes(&state.settings_boot_cajas) {
+        Ok(cajas) => cajas,
+        Err(error) => {
+            state.status = error;
+            return;
+        }
+    };
+    let mut frase = String::new();
+    std::mem::swap(&mut frase, &mut state.settings_boot_frase);
+    if frase.trim().is_empty() {
+        frase.zeroize();
+        state.status = "La frase principal es obligatoria para validar el vault.".to_string();
+        return;
+    }
+
+    let (secondary_cajas, secondary_frase) = match secondary_settings_credentials(state) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            frase.zeroize();
+            state.status = error;
+            return;
+        }
+    };
+    let (duress_cajas, duress_frase) = match duress_settings_credentials(state) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            frase.zeroize();
+            if let Some(mut value) = secondary_frase {
+                value.zeroize();
+            }
+            state.status = error;
+            return;
+        }
+    };
+
+    match security::boot_shield_set_duress_key(
+        cajas,
+        frase,
+        secondary_cajas,
+        secondary_frase,
+        duress_cajas,
+        duress_frase,
+    ) {
+        Ok(_) => {
+            zeroize_boxes(&mut state.settings_duress_cajas);
+            state.settings_duress_frase.zeroize();
+            state.settings_duress_frase.clear();
+            state.status =
+                "Clave de coaccion configurada. Un uso real ejecutara borrado silencioso."
+                    .to_string();
+            state.add_log("Clave de coaccion Boot Shield configurada.");
+        }
+        Err(error) => {
+            state.status = format!("No se pudo configurar clave de coaccion: {}", error);
+        }
+    }
+}
+
 fn enable_boot_shield_from_settings(state: &mut TuiState) {
     let cajas = match parse_boxes(&state.settings_boot_cajas) {
         Ok(cajas) => cajas,
@@ -3850,12 +4591,20 @@ fn enable_boot_shield_from_settings(state: &mut TuiState) {
         state.status = "La frase Boot Shield no puede estar vacia.".to_string();
         return;
     }
+    let (secondary_cajas, secondary_frase) = match secondary_settings_credentials(state) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            frase.zeroize();
+            state.status = error;
+            return;
+        }
+    };
     match security::boot_shield_enable(
         cajas,
         frase,
         Some(state.settings_boot_template.clone()),
-        None,
-        None,
+        secondary_cajas,
+        secondary_frase,
     ) {
         Ok(_) => {
             state.status = "Boot Shield creado. Cierre y reinicie Livencrypt.".to_string();
@@ -3876,7 +4625,15 @@ fn disable_boot_shield_from_settings(state: &mut TuiState) {
     };
     let mut frase = String::new();
     std::mem::swap(&mut frase, &mut state.settings_boot_frase);
-    match security::boot_shield_disable(cajas, frase, None, None) {
+    let (secondary_cajas, secondary_frase) = match secondary_settings_credentials(state) {
+        Ok(credentials) => credentials,
+        Err(error) => {
+            frase.zeroize();
+            state.status = error;
+            return;
+        }
+    };
+    match security::boot_shield_disable(cajas, frase, secondary_cajas, secondary_frase) {
         Ok(_) => {
             state.status = "Boot Shield desactivado y plantillas exportadas.".to_string();
             state.refresh_templates_count();
@@ -3949,7 +4706,7 @@ fn handle_recovery_key(state: &mut TuiState, key: KeyEvent) {
 }
 
 fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
-    let area = frame.size();
+    let area = frame.area();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
         draw_terminal_size_warning(frame, area);
         return;
@@ -3977,10 +4734,11 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
         Screen::SystemMonitor => draw_system_monitor(frame, inner, state),
         Screen::AuditMonitor => draw_audit_monitor(frame, inner),
         Screen::FirmwareStaging => draw_firmware_staging(frame, inner, state),
-        Screen::SandboxManager => draw_sandbox_manager(frame, inner),
+        Screen::SandboxManager => draw_sandbox_manager(frame, inner, state),
         Screen::RecoveryMode => draw_recovery_mode(frame, inner, state),
         Screen::InstallProfile => draw_install_profile(frame, inner),
         Screen::WalletGateway => draw_wallet_gateway(frame, inner, state),
+        Screen::WalletAuditor => draw_wallet_auditor(frame, inner, state),
     }
 
     if state.show_file_browser {
@@ -4003,6 +4761,9 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
                 state.last_forensic_report_path.as_ref(),
             );
         }
+    }
+    if let Some(preview) = &state.pending_signing_preview {
+        draw_signing_authorization_modal(frame, inner, preview);
     }
 }
 
@@ -4033,6 +4794,65 @@ fn draw_terminal_size_warning(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(warning, popup);
 }
 
+fn draw_signing_authorization_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    preview: &SigningRequestPreview,
+) {
+    let popup = centered_area(area, 78, 56);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            "AUTORIZACION REQUERIDA - PASARELA WEB3",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "ID solicitud: {} | Red: {:?} | chain_id: {}",
+            preview.request_id, preview.chain, preview.chain_id
+        )),
+        Line::from(format!(
+            "Ruta: m/44'/{}/{}'/0/{}",
+            preview.chain_id, preview.account_index, preview.address_index
+        )),
+        Line::from(format!("Metodo: {:?}", preview.method)),
+        Line::from(format!(
+            "Destino declarado: {}",
+            preview
+                .target_dex_cex_id
+                .as_deref()
+                .unwrap_or("sin destino declarado")
+        )),
+        Line::from(format!("Valor externo USD: {}", preview.value_usd)),
+        Line::from(format!(
+            "Volumen efectivo parseado: {}",
+            preview.effective_volume_units
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Resumen parseado por backend:",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(preview.summary.clone()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "F10/A autoriza la firma | Esc/D rechaza y responde error al socket",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirmacion fisica de firma ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(modal, popup);
+}
+
 fn draw_file_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let popup = centered_area(area, 82, 72);
     frame.render_widget(Clear, popup);
@@ -4049,6 +4869,7 @@ fn draw_file_browser(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         FileBrowserTarget::Input => "origen",
         FileBrowserTarget::Output => "destino",
         FileBrowserTarget::TextExport => "exportacion texto",
+        FileBrowserTarget::SandboxPayload => "payload sandbox",
     };
     let prompt = if matches!(state.file_browser_target, FileBrowserTarget::TextExport)
         && state.file_browser.name_mode
@@ -4321,18 +5142,20 @@ fn draw_forensic_summary(
 fn draw_unlock(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let hardening = security::process_hardening::process_hardening_status();
     let has_warnings = !hardening.warnings.is_empty();
+    let double_mode = state.unlock_requires_secondary();
+    let form_height = if double_mode { 15 } else { 10 };
     let constraints = if has_warnings {
         vec![
             Constraint::Length(4),
             Constraint::Length(3),
-            Constraint::Length(10),
+            Constraint::Length(form_height),
             Constraint::Length(8),
             Constraint::Min(4),
         ]
     } else {
         vec![
             Constraint::Length(4),
-            Constraint::Length(10),
+            Constraint::Length(form_height),
             Constraint::Length(8),
             Constraint::Min(4),
         ]
@@ -4349,7 +5172,14 @@ fn draw_unlock(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("Acceso por descifrado: 5 cajas + frase exacta."),
+        Line::from(format!(
+            "Acceso por descifrado: {}.",
+            if double_mode {
+                "2 credenciales: A+B, cada una con 5 cajas + frase exacta"
+            } else {
+                "5 cajas + frase exacta"
+            }
+        )),
         Line::from("Tab/clic cambia campo. Enter/F10 desbloquea. Esc sale limpiando campos."),
     ])
     .alignment(Alignment::Center)
@@ -4375,6 +5205,12 @@ fn draw_unlock(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     }
 
     let mut fields = Vec::new();
+    fields.push(Line::from(Span::styled(
+        "Custodio A / credencial principal",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )));
     for index in 0..5 {
         let marker = if state.focus == index { ">" } else { " " };
         fields.push(Line::from(vec![
@@ -4392,11 +5228,42 @@ fn draw_unlock(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Span::styled(" FRASE: ", Style::default().fg(Color::Cyan)),
         Span::raw("*".repeat(state.frase.chars().count())),
     ]));
+    if double_mode {
+        fields.push(Line::from(""));
+        fields.push(Line::from(Span::styled(
+            "Custodio B / credencial secundaria",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for index in 0..5 {
+            let focus_index = 6 + index;
+            let marker = if state.focus == focus_index { ">" } else { " " };
+            fields.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(
+                    format!(" CAJA B{}: ", index + 1),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(&state.secondary_cajas[index]),
+            ]));
+        }
+        let phrase_marker = if state.focus == 11 { ">" } else { " " };
+        fields.push(Line::from(vec![
+            Span::raw(phrase_marker),
+            Span::styled(" FRASE B: ", Style::default().fg(Color::Cyan)),
+            Span::raw("*".repeat(state.secondary_frase.chars().count())),
+        ]));
+    }
 
     let form = Paragraph::new(fields)
         .block(
             Block::default()
-                .title(" Credenciales ")
+                .title(if double_mode {
+                    " Credenciales Boot Shield doble "
+                } else {
+                    " Credenciales "
+                })
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false });
@@ -4463,7 +5330,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(7),
-            Constraint::Length(14),
+            Constraint::Length(17),
             Constraint::Min(4),
         ])
         .split(area);
@@ -4521,6 +5388,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             state.cached_volume_units
         )),
         ListItem::new("w = pasarela Web3 / custodia"),
+        ListItem::new("k = auditor visual de direcciones publicas"),
         ListItem::new("t = cifrar texto"),
         ListItem::new("f = cifrar archivo"),
         ListItem::new("e = editor de plantillas"),
@@ -4766,6 +5634,175 @@ fn draw_wallet_gateway_reset_modal(frame: &mut Frame<'_>, area: Rect, state: &Tu
             .style(Style::default().fg(Color::DarkGray)),
         chunks[3],
     );
+}
+
+fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(6),
+            Constraint::Min(8),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(Line::from(vec![
+        Span::styled(
+            " AUDITOR VISUAL DE DIRECCIONES PUBLICAS ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("solo deriva claves publicas; no firma transacciones"),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(header, chunks[0]);
+
+    let focused = |index: usize| {
+        if state.auditor_focus == index {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let controls = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("[Red] ", focused(0)),
+            Span::raw(format!("{:?}", selected_auditor_chain(state))),
+            Span::raw("   use ←/→ o clic"),
+        ]),
+        Line::from(vec![
+            Span::styled("[Cuenta] ", focused(1)),
+            Span::raw(&state.auditor_account_index),
+            Span::raw("   +/- ajusta"),
+        ]),
+        Line::from(vec![
+            Span::styled("[Indice] ", focused(2)),
+            Span::raw(&state.auditor_address_index),
+            Span::raw("   Enter deriva"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            &state.auditor_status,
+            Style::default().fg(Color::Magenta),
+        )),
+    ])
+    .block(
+        Block::default()
+            .title(" Selector local ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(controls, chunks[1]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(chunks[2]);
+
+    let mut details = vec![
+        Line::from(vec![
+            Span::styled("Direccion / etiqueta: ", Style::default().fg(Color::Cyan)),
+            Span::raw(if state.auditor_address.is_empty() {
+                "pendiente de derivacion"
+            } else {
+                &state.auditor_address
+            }),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Clave publica hexadecimal:",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+    if state.auditor_public_key_hex.is_empty() {
+        details.push(Line::from("pendiente"));
+    } else {
+        for line in chunk_string(&state.auditor_public_key_hex, 72)
+            .into_iter()
+            .take(8)
+        {
+            details.push(Line::from(line));
+        }
+    }
+    let details_box = Paragraph::new(details)
+        .block(
+            Block::default()
+                .title(" Resultado criptografico ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(details_box, body[0]);
+
+    let fingerprint_source = if state.auditor_address.is_empty() {
+        "LIVENCRYPT-AUDITOR-PENDING"
+    } else {
+        &state.auditor_address
+    };
+    let fingerprint = Paragraph::new(address_fingerprint_lines(fingerprint_source))
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .title(" Huella visual ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        );
+    frame.render_widget(fingerprint, body[1]);
+
+    let footer = Paragraph::new(
+        "Enter deriva | Tab campo | ←/→ red | +/- indices | clic deriva/volver | Esc dashboard",
+    )
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(footer, chunks[3]);
+}
+
+fn chunk_string(value: &str, chunk_chars: usize) -> Vec<String> {
+    if value.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        current.push(ch);
+        if current.chars().count() >= chunk_chars {
+            chunks.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn address_fingerprint_lines(value: &str) -> Vec<Line<'static>> {
+    let digest = Keccak256::digest(value.as_bytes());
+    let mut lines = Vec::new();
+    lines.push(Line::from("Comparacion visual local"));
+    lines.push(Line::from(""));
+    for row in 0..9 {
+        let mut text = String::with_capacity(19);
+        text.push(' ');
+        for col in 0..17 {
+            let byte = digest[(row * 17 + col) % digest.len()];
+            let bit = (byte >> (col % 8)) & 1;
+            text.push(if bit == 1 { '#' } else { '.' });
+        }
+        lines.push(Line::from(text));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(truncate_chars(value, 32)));
+    lines
 }
 
 fn draw_text_cipher(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -5356,6 +6393,42 @@ fn settings_box_line(state: &TuiState, index: usize) -> Line<'static> {
     ])
 }
 
+fn settings_secondary_box_line(state: &TuiState, index: usize) -> Line<'static> {
+    let focus_index = 7 + index;
+    let valid = box_value_valid(&state.settings_boot_secondary_cajas[index]);
+    let style = if valid {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![
+        Span::raw(format!(
+            "{} caja B{}: ",
+            marker(state.settings_focus == focus_index),
+            index + 1
+        )),
+        Span::styled(state.settings_boot_secondary_cajas[index].clone(), style),
+    ])
+}
+
+fn settings_duress_box_line(state: &TuiState, index: usize) -> Line<'static> {
+    let focus_index = 13 + index;
+    let valid = box_value_valid(&state.settings_duress_cajas[index]);
+    let style = if valid {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    };
+    Line::from(vec![
+        Span::raw(format!(
+            "{} caja D{}: ",
+            marker(state.settings_focus == focus_index),
+            index + 1
+        )),
+        Span::styled(state.settings_duress_cajas[index].clone(), style),
+    ])
+}
+
 fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5364,9 +6437,12 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let hardening = security::process_hardening::process_hardening_status();
     let apparmor = security::apparmor::apparmor_status();
     let lines = vec![
-        Line::from("clic/Tab campos | B Boot Shield ON | O OFF | S red | T inactividad | +/- segundos | P AppArmor ON | U OFF | Esc"),
+        Line::from("clic/Tab campos | PgUp/PgDown scroll | B Boot ON | O OFF | D coaccion | S red | T inactividad | P AppArmor ON | U OFF | Esc"),
         Line::from(""),
-        Line::from("SECCION: ACCESO"),
+        Line::from(format!(
+            "SECCION: ACCESO | modo vault actual: {}",
+            state.boot_credential_mode
+        )),
         settings_box_line(state, 0),
         settings_box_line(state, 1),
         settings_box_line(state, 2),
@@ -5374,16 +6450,33 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         settings_box_line(state, 4),
         Line::from(format!("{} frase: {}", marker(state.settings_focus == 5), "*".repeat(state.settings_boot_frase.chars().count()))),
         Line::from(format!("{} plantilla arranque: {}", marker(state.settings_focus == 6), state.settings_boot_template)),
+        Line::from(""),
+        Line::from("SECCION: DOBLE CREDENCIAL OPCIONAL"),
+        settings_secondary_box_line(state, 0),
+        settings_secondary_box_line(state, 1),
+        settings_secondary_box_line(state, 2),
+        settings_secondary_box_line(state, 3),
+        settings_secondary_box_line(state, 4),
+        Line::from(format!("{} frase B: {}", marker(state.settings_focus == 12), "*".repeat(state.settings_boot_secondary_frase.chars().count()))),
+        Line::from(""),
+        Line::from("SECCION: CLAVE DE COACCION"),
+        settings_duress_box_line(state, 0),
+        settings_duress_box_line(state, 1),
+        settings_duress_box_line(state, 2),
+        settings_duress_box_line(state, 3),
+        settings_duress_box_line(state, 4),
+        Line::from(format!("{} frase D: {}", marker(state.settings_focus == 18), "*".repeat(state.settings_duress_frase.chars().count()))),
+        Line::from("Al introducirla en el arranque se muestra fallo fisico simulado y se destruye el vault."),
         Line::from(format!(
             "{} bloqueo inactividad: {} ({}s)",
-            marker(state.settings_focus == 9),
+            marker(state.settings_focus == 21),
             if state.inactivity_enabled { "ON" } else { "OFF" },
             state.inactivity_timeout_seconds
         )),
         Line::from(""),
         Line::from("SECCION: RED (solo configuracion, no se ejecutan pruebas de red)"),
-        Line::from(format!("{} perfil: {}", marker(state.settings_focus == 7), state.settings_network_profile)),
-        Line::from(format!("{} confirmacion: {}", marker(state.settings_focus == 8), state.settings_network_confirmation)),
+        Line::from(format!("{} perfil: {}", marker(state.settings_focus == 19), state.settings_network_profile)),
+        Line::from(format!("{} confirmacion: {}", marker(state.settings_focus == 20), state.settings_network_confirmation)),
         Line::from(""),
         Line::from("SECCION: HARDENING"),
         Line::from(format!("CORE DUMPS: {}", if hardening.core_dumps_disabled { "OFF" } else { "ON" })),
@@ -5402,9 +6495,13 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title(" Configuracion del sistema ")
+                    .title(format!(
+                        " Configuracion del sistema | scroll {} ",
+                        state.settings_scroll
+                    ))
                     .borders(Borders::ALL),
             )
+            .scroll((state.settings_scroll, 0))
             .wrap(Wrap { trim: false }),
         chunks[0],
     );
@@ -5576,38 +6673,111 @@ fn draw_firmware_staging(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(status, chunks[1]);
 }
 
-fn draw_sandbox_manager(frame: &mut Frame<'_>, area: Rect) {
+fn draw_sandbox_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(6)])
+        .constraints([Constraint::Min(10), Constraint::Length(7)])
         .split(area);
 
-    let summary = security::sandbox::sandbox_capability_summary()
-        .into_iter()
-        .map(Line::from)
-        .collect::<Vec<_>>();
-    let panel = Paragraph::new(summary)
-        .block(
-            Block::default()
-                .title(" Sandbox expu ")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(panel, chunks[0]);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(chunks[0]);
 
-    let risk = security::ai_monitor::expu_baseline_risk();
-    let body = Paragraph::new(vec![
-        Line::from(format!("Riesgo heuristico base: {:.0}%", risk * 100.0)),
-        Line::from("Loader memfd integrado como API Linux-gated."),
-        Line::from("No se ejecuta automaticamente ningun binario desde esta pantalla."),
-        Line::from("Esc = volver"),
+    let field_style = |index: usize| {
+        if state.sandbox_focus == index {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let launcher = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Lanzador de procesos en RAM",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled("[Ruta binario] ", field_style(0)),
+            Span::raw(truncate_chars(&state.sandbox_payload_path, 76)),
+        ]),
+        Line::from(vec![
+            Span::styled("[Memoria MiB] ", field_style(1)),
+            Span::raw(&state.sandbox_memory_mib),
+        ]),
+        Line::from(vec![
+            Span::styled("[CPU segundos] ", field_style(2)),
+            Span::raw(&state.sandbox_cpu_seconds),
+        ]),
+        Line::from(vec![
+            Span::styled("[Archivo MiB] ", field_style(3)),
+            Span::raw(&state.sandbox_file_size_mib),
+        ]),
+        Line::from(""),
+        Line::from("Enter lanza memfd | B explorador | K mata PID seleccionado | Esc vuelve"),
+        Line::from(Span::styled(
+            &state.sandbox_status,
+            Style::default().fg(Color::Magenta),
+        )),
     ])
     .block(
         Block::default()
-            .title(" IA/heuristica local ")
+            .title(" Sandbox expu - lanzador ")
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(launcher, body[0]);
+
+    let active = if state.sandbox_active_pids.is_empty() {
+        vec![ListItem::new("Sin procesos sandbox activos.")]
+    } else {
+        state
+            .sandbox_active_pids
+            .iter()
+            .enumerate()
+            .map(|(index, pid)| {
+                let prefix = if index == state.sandbox_selected_pid {
+                    ">"
+                } else {
+                    " "
+                };
+                ListItem::new(format!(
+                    "{} PID {} | memfd | NEWNET/NEWNS/NEWIPC",
+                    prefix, pid
+                ))
+            })
+            .collect::<Vec<_>>()
+    };
+    let monitor = List::new(active).block(
+        Block::default()
+            .title(" Procesos sandbox ")
             .borders(Borders::ALL),
     );
-    frame.render_widget(body, chunks[1]);
+    frame.render_widget(monitor, body[1]);
+
+    let risk = security::ai_monitor::expu_baseline_risk();
+    let mut footer_lines = security::sandbox::sandbox_capability_summary()
+        .into_iter()
+        .map(Line::from)
+        .collect::<Vec<_>>();
+    footer_lines.insert(
+        0,
+        Line::from(format!("Riesgo heuristico base: {:.0}%", risk * 100.0)),
+    );
+    footer_lines.push(Line::from(
+        "Esta pantalla no ejecuta nada automaticamente; Enter lanza el payload seleccionado.",
+    ));
+    let footer = Paragraph::new(footer_lines)
+        .block(
+            Block::default()
+                .title(" Capacidades y control ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(footer, chunks[1]);
 }
 
 fn draw_recovery_mode(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

@@ -4,8 +4,30 @@
 
 #![allow(unsafe_code)]
 
+#[derive(Clone, Copy, Debug)]
+pub struct SandboxLimits {
+    pub memory_mib: u64,
+    pub cpu_seconds: u64,
+    pub file_size_mib: u64,
+}
+
+impl Default for SandboxLimits {
+    fn default() -> Self {
+        Self {
+            memory_mib: 512,
+            cpu_seconds: 120,
+            file_size_mib: 64,
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn enter_restricted_child() -> Result<(), String> {
+    enter_restricted_child_with_limits(SandboxLimits::default())
+}
+
+#[cfg(target_os = "linux")]
+pub fn enter_restricted_child_with_limits(limits: SandboxLimits) -> Result<(), String> {
     use libc::{
         prctl, rlimit, setrlimit, unshare, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWNS,
         PR_SET_NO_NEW_PRIVS, RLIMIT_AS, RLIMIT_CPU, RLIMIT_FSIZE,
@@ -21,16 +43,16 @@ pub fn enter_restricted_child() -> Result<(), String> {
         }
 
         let memory = rlimit {
-            rlim_cur: 512 * 1024 * 1024,
-            rlim_max: 512 * 1024 * 1024,
+            rlim_cur: limits.memory_mib.saturating_mul(1024 * 1024),
+            rlim_max: limits.memory_mib.saturating_mul(1024 * 1024),
         };
         let cpu = rlimit {
-            rlim_cur: 120,
-            rlim_max: 120,
+            rlim_cur: limits.cpu_seconds,
+            rlim_max: limits.cpu_seconds,
         };
         let file_size = rlimit {
-            rlim_cur: 64 * 1024 * 1024,
-            rlim_max: 64 * 1024 * 1024,
+            rlim_cur: limits.file_size_mib.saturating_mul(1024 * 1024),
+            rlim_max: limits.file_size_mib.saturating_mul(1024 * 1024),
         };
 
         let _ = setrlimit(RLIMIT_AS, &memory);
@@ -43,6 +65,11 @@ pub fn enter_restricted_child() -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn enter_restricted_child() -> Result<(), String> {
+    Err("Sandbox expu solo soportado en Linux.".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn enter_restricted_child_with_limits(_limits: SandboxLimits) -> Result<(), String> {
     Err("Sandbox expu solo soportado en Linux.".into())
 }
 
@@ -64,8 +91,8 @@ pub fn sandbox_capability_summary() -> Vec<String> {
         format!("SO Linux: {}", cfg!(target_os = "linux")),
         "NO_NEW_PRIVS: integrado en hijo".to_string(),
         "Namespaces: NEWNET/NEWNS/NEWIPC en hijo Linux".to_string(),
-        "RLIMIT_AS: 512 MiB".to_string(),
-        "RLIMIT_CPU: 120 segundos".to_string(),
-        "RLIMIT_FSIZE: 64 MiB".to_string(),
+        "RLIMIT_AS: configurable en lanzador TUI".to_string(),
+        "RLIMIT_CPU: configurable en lanzador TUI".to_string(),
+        "RLIMIT_FSIZE: configurable en lanzador TUI".to_string(),
     ]
 }

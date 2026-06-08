@@ -84,8 +84,9 @@ pub fn decrypt_text(token: &str, secret: &str) -> Result<String, String> {
         },
     );
     key.zeroize();
-    let plaintext = plaintext
-        .map_err(|_| "autenticacion AEAD fallida: texto manipulado o clave incorrecta".to_string())?;
+    let plaintext = plaintext.map_err(|_| {
+        "autenticacion AEAD fallida: texto manipulado o clave incorrecta".to_string()
+    })?;
 
     String::from_utf8(plaintext).map_err(|_| "el texto descifrado no es UTF-8 valido".to_string())
 }
@@ -98,7 +99,10 @@ mod tests {
     fn secure_text_roundtrip() {
         let secret = "clave de texto segura 2026";
         let token = encrypt_text("mensaje confidencial", secret).expect("cifrar");
-        assert_eq!(decrypt_text(&token, secret).expect("descifrar"), "mensaje confidencial");
+        assert_eq!(
+            decrypt_text(&token, secret).expect("descifrar"),
+            "mensaje confidencial"
+        );
     }
 
     #[test]

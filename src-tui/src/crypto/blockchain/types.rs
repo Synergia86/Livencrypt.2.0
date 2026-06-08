@@ -42,6 +42,20 @@ pub struct TransactionSignRequest {
     pub target_dex_cex_id: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SigningRequestPreview {
+    pub request_id: u64,
+    pub chain: ChainType,
+    pub chain_id: u64,
+    pub account_index: u32,
+    pub address_index: u32,
+    pub method: TxMethod,
+    pub summary: String,
+    pub target_dex_cex_id: Option<String>,
+    pub value_usd: Decimal,
+    pub effective_volume_units: Decimal,
+}
+
 impl Drop for TransactionSignRequest {
     fn drop(&mut self) {
         self.raw_tx_payload.zeroize();

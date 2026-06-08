@@ -6,6 +6,19 @@
 
 #[cfg(target_os = "linux")]
 pub fn load_and_execute_in_ram(name: &str, binary_data: &mut [u8]) -> Result<i32, String> {
+    load_and_execute_in_ram_with_limits(
+        name,
+        binary_data,
+        crate::security::sandbox::SandboxLimits::default(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn load_and_execute_in_ram_with_limits(
+    name: &str,
+    binary_data: &mut [u8],
+    limits: crate::security::sandbox::SandboxLimits,
+) -> Result<i32, String> {
     use libc::{c_char, close, execve, fork, memfd_create};
     use std::ffi::CString;
     use std::ptr;
@@ -29,7 +42,7 @@ pub fn load_and_execute_in_ram(name: &str, binary_data: &mut [u8]) -> Result<i32
 
     let pid = unsafe { fork() };
     if pid == 0 {
-        if crate::security::sandbox::enter_restricted_child().is_err() {
+        if crate::security::sandbox::enter_restricted_child_with_limits(limits).is_err() {
             unsafe {
                 close(fd);
             }
@@ -77,6 +90,17 @@ fn write_all_fd(fd: i32, mut bytes: &[u8]) -> Result<(), String> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn load_and_execute_in_ram(_name: &str, binary_data: &mut [u8]) -> Result<i32, String> {
+    use zeroize::Zeroize;
+    binary_data.zeroize();
+    Err("memfd_create solo esta disponible en Linux.".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn load_and_execute_in_ram_with_limits(
+    _name: &str,
+    binary_data: &mut [u8],
+    _limits: crate::security::sandbox::SandboxLimits,
+) -> Result<i32, String> {
     use zeroize::Zeroize;
     binary_data.zeroize();
     Err("memfd_create solo esta disponible en Linux.".into())
