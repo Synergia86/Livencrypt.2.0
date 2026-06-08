@@ -27,7 +27,7 @@ fn target_arch() -> Result<TargetArch, String> {
 #[cfg(target_os = "linux")]
 fn denied_syscalls() -> Vec<libc::c_long> {
     // Llamadas que comprometen memoria, depuracion o persistencia del nucleo.
-    vec![
+    let mut syscalls = vec![
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
@@ -36,8 +36,6 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
-        libc::SYS_iopl,
-        libc::SYS_ioperm,
         libc::SYS_perf_event_open,
         libc::SYS_personality,
         libc::SYS_mount,
@@ -46,7 +44,16 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_setns,
         libc::SYS_swapon,
         libc::SYS_swapoff,
-    ]
+    ];
+
+    // Acceso directo a puertos de E/S, exclusivo de la arquitectura amd64.
+    #[cfg(target_arch = "x86_64")]
+    {
+        syscalls.push(libc::SYS_iopl);
+        syscalls.push(libc::SYS_ioperm);
+    }
+
+    syscalls
 }
 
 /// Aplica una lista negra de syscalls peligrosas (acción por defecto permitir,

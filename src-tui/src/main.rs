@@ -211,28 +211,14 @@ fn safe_test_templates() -> Result<(), String> {
 }
 
 fn safe_test_text_cipher() -> Result<(), String> {
-    let cajas = [1, 2, 3, 4, 5];
-    let plain = "abc123";
-    let encrypted = livencrypt_lib::cipher_text(
-        plain,
-        DEFAULT_TEMPLATE,
-        cajas,
-        4,
-        PASSWORD_DIRECTION_BEFORE,
-        DEFAULT_CONTROL_SYMBOLS,
-    )?;
-    let decrypted = livencrypt_lib::decipher_text(
-        &encrypted.result,
-        DEFAULT_TEMPLATE,
-        cajas,
-        4,
-        PASSWORD_DIRECTION_BEFORE,
-        DEFAULT_CONTROL_SYMBOLS,
-    )?;
-    if decrypted.result != plain {
+    let plain = "abc123 prueba livencrypt";
+    let secret = "clave de texto segura 2026";
+    let encrypted = livencrypt_lib::cipher_text_secure(plain, secret)?;
+    let decrypted = livencrypt_lib::decipher_text_secure(&encrypted, secret)?;
+    if decrypted != plain {
         return Err(format!(
             "Roundtrip texto fallo: esperado '{}', obtenido '{}'.",
-            plain, decrypted.result
+            plain, decrypted
         ));
     }
     println!("OK texto: cifrar/descifrar.");
@@ -2797,115 +2783,18 @@ fn paste_text_into_text_cipher(state: &mut TuiState, text: &str) {
     state.status = "Texto pegado.".to_string();
 }
 
-fn control_symbols_in_text(text: &str, control_symbols: &str) -> bool {
-    text.chars().any(|ch| control_symbols.contains(ch))
-}
-
-fn validate_control_password_segment(
-    text: &str,
-    password_len: usize,
-    password_direction: &str,
-    control_symbols: &str,
-) -> bool {
-    let chars = text.chars().collect::<Vec<_>>();
-    let plen = password_len.max(2);
-    for (index, value) in chars.iter().enumerate() {
-        if !control_symbols.contains(*value) {
-            continue;
-        }
-        if password_direction == "after" {
-            if index + 1 >= plen {
-                return true;
-            }
-        } else if index + plen <= chars.len() {
-            return true;
-        }
-    }
-    false
-}
-
 fn run_text_cipher(state: &mut TuiState, encrypt: bool) {
-    if prepare_text_password_prompt(state, encrypt) {
-        return;
-    }
     execute_text_cipher(state, encrypt);
 }
 
-fn prepare_text_password_prompt(state: &mut TuiState, encrypt: bool) -> bool {
-    let cajas = match parse_boxes(&state.text_cajas) {
-        Ok(cajas) => cajas,
-        Err(error) => {
-            state.status = error;
-            return true;
-        }
-    };
-    let password_length = state
-        .text_password_length
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(8)
-        .clamp(2, 25);
-    if !control_symbols_in_text(&state.text_input, &state.text_control_symbols) {
-        return false;
+fn text_secret_material(cajas: &[i64; 5], passphrase: &str) -> String {
+    let mut secret = String::from("LVC-TEXT-V1|");
+    for caja in cajas {
+        secret.push_str(&caja.to_string());
+        secret.push('|');
     }
-    if !validate_control_password_segment(
-        &state.text_input,
-        password_length,
-        &state.text_password_direction,
-        &state.text_control_symbols,
-    ) {
-        state.status = format!(
-            "Contraseña detectada pero no valida: revise longitud {} y posicion {}.",
-            password_length,
-            password_direction_label(&state.text_password_direction)
-        );
-        return true;
-    }
-
-    let result = if encrypt {
-        livencrypt_lib::cipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    } else {
-        livencrypt_lib::decipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    };
-
-    match result {
-        Ok(result) => {
-            if let Some(password) = result.detected_password {
-                state.text_password_expected.zeroize();
-                state.text_password_expected = password;
-                state.text_password_prompt_input.zeroize();
-                state.text_password_prompt_input.clear();
-                state.text_password_pending_encrypt = encrypt;
-                state.text_password_attempts = 0;
-                state.show_text_password_prompt = true;
-                state.status =
-                    "Contraseña detectada. Valide la contraseña para continuar.".to_string();
-                true
-            } else {
-                state.status =
-                    "Simbolo de control detectado, pero no se pudo extraer contraseña.".to_string();
-                true
-            }
-        }
-        Err(error) => {
-            state.status = format!("Error de texto: {}", error);
-            true
-        }
-    }
+    secret.push_str(passphrase);
+    secret
 }
 
 fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
@@ -2917,63 +2806,21 @@ fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
             return;
         }
     };
-    let password_length = state
-        .text_password_length
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(8)
-        .clamp(2, 25);
-    if control_symbols_in_text(&state.text_input, &state.text_control_symbols)
-        && !validate_control_password_segment(
-            &state.text_input,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    {
-        state.status = format!(
-            "Contraseña detectada pero no valida: revise longitud {} y posicion {}.",
-            password_length,
-            password_direction_label(&state.text_password_direction)
-        );
-        return;
-    }
+    let mut secret = text_secret_material(&cajas, &state.text_control_symbols);
     let result = if encrypt {
-        livencrypt_lib::cipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
+        livencrypt_lib::cipher_text_secure(&state.text_input, &secret)
     } else {
-        livencrypt_lib::decipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
+        livencrypt_lib::decipher_text_secure(&state.text_input, &secret)
     };
+    secret.zeroize();
 
     match result {
-        Ok(result) => {
-            state.text_output = result.result;
-            state.status = if result.detected_password.is_some() {
-                format!(
-                    "{} con contraseña validada.",
-                    if encrypt {
-                        "Texto cifrado"
-                    } else {
-                        "Texto descifrado"
-                    }
-                )
-            } else if encrypt {
-                "Texto cifrado correctamente.".to_string()
+        Ok(output) => {
+            state.text_output = output;
+            state.status = if encrypt {
+                "Texto cifrado con cifrado fuerte (Argon2id + XChaCha20Poly1305).".to_string()
             } else {
-                "Texto descifrado correctamente.".to_string()
+                "Texto descifrado con cifrado fuerte (Argon2id + XChaCha20Poly1305).".to_string()
             };
             state.add_log(format!(
                 "{} texto completado ({}ms)",
