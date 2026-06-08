@@ -1350,10 +1350,6 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         handle_file_browser_key(state, key);
         return;
     }
-    if state.show_text_password_prompt {
-        handle_text_password_prompt_key(state, key);
-        return;
-    }
     if state.show_matrix_config {
         handle_matrix_config_key(state, key);
         return;
@@ -1390,7 +1386,6 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
 fn handle_paste_event(state: &mut TuiState, text: String) {
     if state.screen != Screen::TextCipher
         || state.show_file_browser
-        || state.show_text_password_prompt
         || state.show_matrix_config
         || state.is_processing
     {
@@ -1484,10 +1479,6 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
     let inner = centered_area(area, 94, 88);
     if state.show_file_browser {
         handle_file_browser_mouse(state, mouse, inner);
-        return;
-    }
-    if state.show_text_password_prompt {
-        handle_text_password_prompt_mouse(state, mouse, inner);
         return;
     }
     if state.is_processing {
@@ -2832,66 +2823,6 @@ fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
     }
 }
 
-fn handle_text_password_prompt_key(state: &mut TuiState, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => close_text_password_prompt(state, false),
-        KeyCode::Backspace => {
-            state.text_password_prompt_input.pop();
-        }
-        KeyCode::Enter => validate_text_password_prompt(state),
-        KeyCode::Char(value) => {
-            state.text_password_prompt_input.push(value);
-        }
-        _ => {}
-    }
-}
-
-fn handle_text_password_prompt_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
-    let popup = centered_area(area, 58, 24);
-    if !point_in_rect(mouse.column, mouse.row, popup) {
-        return;
-    }
-    let confirm_row = popup.y.saturating_add(popup.height).saturating_sub(3);
-    if mouse.row >= confirm_row {
-        validate_text_password_prompt(state);
-    }
-}
-
-fn validate_text_password_prompt(state: &mut TuiState) {
-    if state.text_password_prompt_input == state.text_password_expected {
-        let encrypt = state.text_password_pending_encrypt;
-        close_text_password_prompt(state, true);
-        execute_text_cipher(state, encrypt);
-        return;
-    }
-
-    state.text_password_attempts = state.text_password_attempts.saturating_add(1);
-    if state.text_password_attempts >= 3 {
-        close_text_password_prompt(state, false);
-        state.screen = Screen::Dashboard;
-        state.status = "Contraseña rechazada 3 veces. Ventana de texto cerrada.".to_string();
-    } else {
-        state.text_password_prompt_input.zeroize();
-        state.text_password_prompt_input.clear();
-        state.status = format!(
-            "Contraseña incorrecta. Intentos restantes: {}.",
-            3u8.saturating_sub(state.text_password_attempts)
-        );
-    }
-}
-
-fn close_text_password_prompt(state: &mut TuiState, validated: bool) {
-    state.show_text_password_prompt = false;
-    state.text_password_prompt_input.zeroize();
-    state.text_password_prompt_input.clear();
-    state.text_password_expected.zeroize();
-    state.text_password_expected.clear();
-    state.text_password_attempts = 0;
-    if !validated {
-        state.status = "Validacion de contraseña cancelada.".to_string();
-    }
-}
-
 fn handle_file_cipher_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => state.screen = Screen::Dashboard,
@@ -3833,9 +3764,6 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
     if state.show_file_browser {
         draw_file_browser(frame, inner, state);
     }
-    if state.show_text_password_prompt {
-        draw_text_password_prompt(frame, inner, state);
-    }
     if state.show_matrix_config {
         draw_matrix_config_modal(frame, inner, state);
     }
@@ -4062,7 +3990,7 @@ fn draw_matrix_config_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState)
             }),
         ]),
         Line::from(vec![
-            Span::styled("Simbolos: ", symbols_style),
+            Span::styled("Clave secreta: ", symbols_style),
             Span::raw(symbols),
         ]),
         Line::from(""),
@@ -4075,47 +4003,6 @@ fn draw_matrix_config_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState)
             .border_style(Style::default().fg(Color::Magenta)),
     );
     frame.render_widget(panel, popup);
-}
-
-fn draw_text_password_prompt(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let popup = centered_area(area, 58, 24);
-    frame.render_widget(Clear, popup);
-    let remaining = 3u8.saturating_sub(state.text_password_attempts);
-    let input_mask = "*".repeat(state.text_password_prompt_input.chars().count());
-    let mode = if state.text_password_pending_encrypt {
-        "CIFRAR"
-    } else {
-        "DESCIFRAR"
-    };
-    let body = vec![
-        Line::from(Span::styled(
-            "CONTRASEÑA DETECTADA",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(format!("Operacion pendiente: {}", mode)),
-        Line::from("Inserte la contraseña exacta para continuar."),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Contraseña: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input_mask),
-        ]),
-        Line::from(""),
-        Line::from(format!("Intentos restantes: {}", remaining)),
-        Line::from("Enter valida | Esc cancela | clic abajo valida"),
-    ];
-    let modal = Paragraph::new(body)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(" Validacion previa ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(modal, popup);
 }
 
 fn short_hash(value: &str) -> String {
