@@ -13,6 +13,7 @@ use crossterm::terminal::{
 use livencrypt_lib::crypto::blockchain::breaker::GatewaySecurityState;
 use livencrypt_lib::crypto::blockchain::firewall::{FirewallRules, LiveFirewall};
 use livencrypt_lib::crypto::blockchain::multi_curve::UniversalKeymaster;
+use livencrypt_lib::crypto::blockchain::nodes::{self, NodeRegistry};
 use livencrypt_lib::crypto::blockchain::supervisor::GatewaySupervisor;
 use livencrypt_lib::crypto::blockchain::types::{ChainType, SigningRequestPreview};
 use livencrypt_lib::crypto::blockchain::worker::{
@@ -217,28 +218,14 @@ fn safe_test_templates() -> Result<(), String> {
 }
 
 fn safe_test_text_cipher() -> Result<(), String> {
-    let cajas = [1, 2, 3, 4, 5];
-    let plain = "abc123";
-    let encrypted = livencrypt_lib::cipher_text(
-        plain,
-        DEFAULT_TEMPLATE,
-        cajas,
-        4,
-        PASSWORD_DIRECTION_BEFORE,
-        DEFAULT_CONTROL_SYMBOLS,
-    )?;
-    let decrypted = livencrypt_lib::decipher_text(
-        &encrypted.result,
-        DEFAULT_TEMPLATE,
-        cajas,
-        4,
-        PASSWORD_DIRECTION_BEFORE,
-        DEFAULT_CONTROL_SYMBOLS,
-    )?;
-    if decrypted.result != plain {
+    let plain = "abc123 prueba livencrypt";
+    let secret = "clave de texto segura 2026";
+    let encrypted = livencrypt_lib::cipher_text_secure(plain, secret)?;
+    let decrypted = livencrypt_lib::decipher_text_secure(&encrypted, secret)?;
+    if decrypted != plain {
         return Err(format!(
             "Roundtrip texto fallo: esperado '{}', obtenido '{}'.",
-            plain, decrypted.result
+            plain, decrypted
         ));
     }
     println!("OK texto: cifrar/descifrar.");
@@ -399,6 +386,7 @@ enum Screen {
     InstallProfile,
     WalletGateway,
     WalletAuditor,
+    NodesManager,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -621,6 +609,11 @@ struct TuiState {
     text_password_pending_encrypt: bool,
     text_password_attempts: u8,
     text_internal_clipboard: String,
+    nodes: NodeRegistry,
+    nodes_chains: Vec<String>,
+    nodes_selected: usize,
+    nodes_editing: bool,
+    nodes_edit_buffer: String,
 
     file_input_path: String,
     file_output_path: String,
@@ -753,6 +746,11 @@ impl TuiState {
             text_password_pending_encrypt: true,
             text_password_attempts: 0,
             text_internal_clipboard: String::new(),
+            nodes: NodeRegistry::default(),
+            nodes_chains: Vec::new(),
+            nodes_selected: 0,
+            nodes_editing: false,
+            nodes_edit_buffer: String::new(),
             file_input_path: String::new(),
             file_output_path: String::new(),
             file_cajas: default_boxes(),
@@ -1625,10 +1623,6 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         handle_file_browser_key(state, key);
         return;
     }
-    if state.show_text_password_prompt {
-        handle_text_password_prompt_key(state, key);
-        return;
-    }
     if state.show_matrix_config {
         handle_matrix_config_key(state, key);
         return;
@@ -1659,14 +1653,17 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         Screen::RecoveryMode => handle_recovery_key(state, key),
         Screen::InstallProfile => handle_back_to_dashboard_key(state, key),
         Screen::WalletGateway => handle_wallet_gateway_key(state, key),
+<<<<<<< HEAD
         Screen::WalletAuditor => handle_wallet_auditor_key(state, key),
+=======
+        Screen::NodesManager => handle_nodes_manager_key(state, key),
+>>>>>>> origin/feature/dev-alexander
     }
 }
 
 fn handle_paste_event(state: &mut TuiState, text: String) {
     if state.screen != Screen::TextCipher
         || state.show_file_browser
-        || state.show_text_password_prompt
         || state.show_matrix_config
         || state.is_processing
     {
@@ -1781,10 +1778,6 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         handle_file_browser_mouse(state, mouse, inner);
         return;
     }
-    if state.show_text_password_prompt {
-        handle_text_password_prompt_mouse(state, mouse, inner);
-        return;
-    }
     if state.is_processing {
         return;
     }
@@ -1807,7 +1800,8 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         | Screen::AuditMonitor
         | Screen::FirmwareStaging
         | Screen::RecoveryMode
-        | Screen::InstallProfile => {
+        | Screen::InstallProfile
+        | Screen::NodesManager => {
             if mouse.row <= inner.y + 1 {
                 state.screen = Screen::Dashboard;
             }
@@ -2377,6 +2371,7 @@ fn handle_back_to_dashboard_key(state: &mut TuiState, key: KeyEvent) {
     }
 }
 
+<<<<<<< HEAD
 fn submit_wallet_auditor_derivation(state: &mut TuiState) {
     let Ok(account_index) = parse_auditor_index(&state.auditor_account_index) else {
         state.auditor_status = "Cuenta invalida: use un entero sin signo.".to_string();
@@ -2637,12 +2632,112 @@ fn handle_sandbox_manager_key(state: &mut TuiState, key: KeyEvent) {
                 state.sandbox_payload_path.push(value);
             } else if value.is_ascii_digit() {
                 active_sandbox_field_mut(state).push(value);
+=======
+fn reload_nodes_manager(state: &mut TuiState) {
+    state.nodes = NodeRegistry::load_from_path(&nodes::default_nodes_path());
+    state.nodes_chains = state.nodes.chain_names();
+    if state.nodes_chains.is_empty() {
+        state.nodes_selected = 0;
+    } else if state.nodes_selected >= state.nodes_chains.len() {
+        state.nodes_selected = state.nodes_chains.len() - 1;
+    }
+}
+
+fn handle_nodes_manager_key(state: &mut TuiState, key: KeyEvent) {
+    if state.nodes_editing {
+        match key.code {
+            KeyCode::Esc => {
+                state.nodes_edit_buffer.zeroize();
+                state.nodes_edit_buffer.clear();
+                state.nodes_editing = false;
+                state.status = "Edicion cancelada.".to_string();
+            }
+            KeyCode::Backspace => {
+                state.nodes_edit_buffer.pop();
+            }
+            KeyCode::Enter => {
+                if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                    let url = state.nodes_edit_buffer.clone();
+                    state.nodes.set_primary(&chain, &url);
+                    state.status = format!("Endpoint principal actualizado para {}.", chain);
+                }
+                state.nodes_edit_buffer.zeroize();
+                state.nodes_edit_buffer.clear();
+                state.nodes_editing = false;
+            }
+            KeyCode::Char(value) => state.nodes_edit_buffer.push(value),
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.nodes_edit_buffer.zeroize();
+            state.nodes_edit_buffer.clear();
+            state.screen = Screen::Dashboard;
+        }
+        KeyCode::Up => {
+            state.nodes_selected = state.nodes_selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if state.nodes_selected + 1 < state.nodes_chains.len() {
+                state.nodes_selected += 1;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                match state.nodes.switch_to_fallback(&chain) {
+                    Some(endpoint) => {
+                        state.status = format!("{} ahora enruta por {}.", chain, endpoint)
+                    }
+                    None => {
+                        state.status =
+                            "Sin nodo de respaldo registrado para esta cadena.".to_string()
+                    }
+                }
+            }
+        }
+        KeyCode::Char('E') | KeyCode::Char('e') => {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                let current = state
+                    .nodes
+                    .current_endpoint(&chain)
+                    .unwrap_or_default()
+                    .to_string();
+                state.nodes_edit_buffer = current;
+                state.nodes_editing = true;
+                state.status =
+                    "Editando endpoint principal. Enter guarda, Esc cancela.".to_string();
+            }
+        }
+        KeyCode::Char('R') | KeyCode::Char('r') => {
+            reload_nodes_manager(state);
+            state.status = "Catalogo de nodos recargado desde disco.".to_string();
+        }
+        KeyCode::Char('G') | KeyCode::Char('g') => {
+            match state.nodes.save_to_path(&nodes::default_nodes_path()) {
+                Ok(()) => state.status = "nodes.toml guardado en disco.".to_string(),
+                Err(error) => state.status = format!("Error guardando nodes.toml: {}", error),
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                if let Some(endpoint) = state.nodes.current_endpoint(&chain) {
+                    let endpoint = endpoint.to_string();
+                    let _ = write_system_clipboard(&endpoint);
+                    state.status = "Endpoint copiado al portapapeles.".to_string();
+                }
+>>>>>>> origin/feature/dev-alexander
             }
         }
         _ => {}
     }
 }
 
+<<<<<<< HEAD
 fn handle_sandbox_manager_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
@@ -2701,6 +2796,8 @@ fn submit_signing_authorization(state: &mut TuiState, approve: bool) {
     };
 }
 
+=======
+>>>>>>> origin/feature/dev-alexander
 fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
     if state.show_breaker_reset {
         handle_wallet_gateway_reset_key(state, key);
@@ -3431,115 +3528,18 @@ fn paste_text_into_text_cipher(state: &mut TuiState, text: &str) {
     state.status = "Texto pegado.".to_string();
 }
 
-fn control_symbols_in_text(text: &str, control_symbols: &str) -> bool {
-    text.chars().any(|ch| control_symbols.contains(ch))
-}
-
-fn validate_control_password_segment(
-    text: &str,
-    password_len: usize,
-    password_direction: &str,
-    control_symbols: &str,
-) -> bool {
-    let chars = text.chars().collect::<Vec<_>>();
-    let plen = password_len.max(2);
-    for (index, value) in chars.iter().enumerate() {
-        if !control_symbols.contains(*value) {
-            continue;
-        }
-        if password_direction == "after" {
-            if index + 1 >= plen {
-                return true;
-            }
-        } else if index + plen <= chars.len() {
-            return true;
-        }
-    }
-    false
-}
-
 fn run_text_cipher(state: &mut TuiState, encrypt: bool) {
-    if prepare_text_password_prompt(state, encrypt) {
-        return;
-    }
     execute_text_cipher(state, encrypt);
 }
 
-fn prepare_text_password_prompt(state: &mut TuiState, encrypt: bool) -> bool {
-    let cajas = match parse_boxes(&state.text_cajas) {
-        Ok(cajas) => cajas,
-        Err(error) => {
-            state.status = error;
-            return true;
-        }
-    };
-    let password_length = state
-        .text_password_length
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(8)
-        .clamp(2, 25);
-    if !control_symbols_in_text(&state.text_input, &state.text_control_symbols) {
-        return false;
+fn text_secret_material(cajas: &[i64; 5], passphrase: &str) -> String {
+    let mut secret = String::from("LVC-TEXT-V1|");
+    for caja in cajas {
+        secret.push_str(&caja.to_string());
+        secret.push('|');
     }
-    if !validate_control_password_segment(
-        &state.text_input,
-        password_length,
-        &state.text_password_direction,
-        &state.text_control_symbols,
-    ) {
-        state.status = format!(
-            "Contraseña detectada pero no valida: revise longitud {} y posicion {}.",
-            password_length,
-            password_direction_label(&state.text_password_direction)
-        );
-        return true;
-    }
-
-    let result = if encrypt {
-        livencrypt_lib::cipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    } else {
-        livencrypt_lib::decipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    };
-
-    match result {
-        Ok(result) => {
-            if let Some(password) = result.detected_password {
-                state.text_password_expected.zeroize();
-                state.text_password_expected = password;
-                state.text_password_prompt_input.zeroize();
-                state.text_password_prompt_input.clear();
-                state.text_password_pending_encrypt = encrypt;
-                state.text_password_attempts = 0;
-                state.show_text_password_prompt = true;
-                state.status =
-                    "Contraseña detectada. Valide la contraseña para continuar.".to_string();
-                true
-            } else {
-                state.status =
-                    "Simbolo de control detectado, pero no se pudo extraer contraseña.".to_string();
-                true
-            }
-        }
-        Err(error) => {
-            state.status = format!("Error de texto: {}", error);
-            true
-        }
-    }
+    secret.push_str(passphrase);
+    secret
 }
 
 fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
@@ -3551,63 +3551,21 @@ fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
             return;
         }
     };
-    let password_length = state
-        .text_password_length
-        .trim()
-        .parse::<usize>()
-        .unwrap_or(8)
-        .clamp(2, 25);
-    if control_symbols_in_text(&state.text_input, &state.text_control_symbols)
-        && !validate_control_password_segment(
-            &state.text_input,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
-    {
-        state.status = format!(
-            "Contraseña detectada pero no valida: revise longitud {} y posicion {}.",
-            password_length,
-            password_direction_label(&state.text_password_direction)
-        );
-        return;
-    }
+    let mut secret = text_secret_material(&cajas, &state.text_control_symbols);
     let result = if encrypt {
-        livencrypt_lib::cipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
+        livencrypt_lib::cipher_text_secure(&state.text_input, &secret)
     } else {
-        livencrypt_lib::decipher_text(
-            &state.text_input,
-            &state.text_template,
-            cajas,
-            password_length,
-            &state.text_password_direction,
-            &state.text_control_symbols,
-        )
+        livencrypt_lib::decipher_text_secure(&state.text_input, &secret)
     };
+    secret.zeroize();
 
     match result {
-        Ok(result) => {
-            state.text_output = result.result;
-            state.status = if result.detected_password.is_some() {
-                format!(
-                    "{} con contraseña validada.",
-                    if encrypt {
-                        "Texto cifrado"
-                    } else {
-                        "Texto descifrado"
-                    }
-                )
-            } else if encrypt {
-                "Texto cifrado correctamente.".to_string()
+        Ok(output) => {
+            state.text_output = output;
+            state.status = if encrypt {
+                "Texto cifrado con cifrado fuerte (Argon2id + XChaCha20Poly1305).".to_string()
             } else {
-                "Texto descifrado correctamente.".to_string()
+                "Texto descifrado con cifrado fuerte (Argon2id + XChaCha20Poly1305).".to_string()
             };
             state.add_log(format!(
                 "{} texto completado ({}ms)",
@@ -3616,66 +3574,6 @@ fn execute_text_cipher(state: &mut TuiState, encrypt: bool) {
             ));
         }
         Err(error) => state.status = format!("Error de texto: {}", error),
-    }
-}
-
-fn handle_text_password_prompt_key(state: &mut TuiState, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => close_text_password_prompt(state, false),
-        KeyCode::Backspace => {
-            state.text_password_prompt_input.pop();
-        }
-        KeyCode::Enter => validate_text_password_prompt(state),
-        KeyCode::Char(value) => {
-            state.text_password_prompt_input.push(value);
-        }
-        _ => {}
-    }
-}
-
-fn handle_text_password_prompt_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
-    let popup = centered_area(area, 58, 24);
-    if !point_in_rect(mouse.column, mouse.row, popup) {
-        return;
-    }
-    let confirm_row = popup.y.saturating_add(popup.height).saturating_sub(3);
-    if mouse.row >= confirm_row {
-        validate_text_password_prompt(state);
-    }
-}
-
-fn validate_text_password_prompt(state: &mut TuiState) {
-    if state.text_password_prompt_input == state.text_password_expected {
-        let encrypt = state.text_password_pending_encrypt;
-        close_text_password_prompt(state, true);
-        execute_text_cipher(state, encrypt);
-        return;
-    }
-
-    state.text_password_attempts = state.text_password_attempts.saturating_add(1);
-    if state.text_password_attempts >= 3 {
-        close_text_password_prompt(state, false);
-        state.screen = Screen::Dashboard;
-        state.status = "Contraseña rechazada 3 veces. Ventana de texto cerrada.".to_string();
-    } else {
-        state.text_password_prompt_input.zeroize();
-        state.text_password_prompt_input.clear();
-        state.status = format!(
-            "Contraseña incorrecta. Intentos restantes: {}.",
-            3u8.saturating_sub(state.text_password_attempts)
-        );
-    }
-}
-
-fn close_text_password_prompt(state: &mut TuiState, validated: bool) {
-    state.show_text_password_prompt = false;
-    state.text_password_prompt_input.zeroize();
-    state.text_password_prompt_input.clear();
-    state.text_password_expected.zeroize();
-    state.text_password_expected.clear();
-    state.text_password_attempts = 0;
-    if !validated {
-        state.status = "Validacion de contraseña cancelada.".to_string();
     }
 }
 
@@ -4369,7 +4267,15 @@ fn append_unique_until_limit(target: &mut Vec<String>, values: Vec<String>, limi
 fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => state.screen = Screen::Dashboard,
+<<<<<<< HEAD
         KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % SETTINGS_FIELD_COUNT,
+=======
+        KeyCode::Char('N') => {
+            state.screen = Screen::NodesManager;
+            reload_nodes_manager(state);
+        }
+        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % 10,
+>>>>>>> origin/feature/dev-alexander
         KeyCode::BackTab => {
             state.settings_focus = if state.settings_focus == 0 {
                 SETTINGS_FIELD_COUNT - 1
@@ -4738,14 +4644,15 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
         Screen::RecoveryMode => draw_recovery_mode(frame, inner, state),
         Screen::InstallProfile => draw_install_profile(frame, inner),
         Screen::WalletGateway => draw_wallet_gateway(frame, inner, state),
+<<<<<<< HEAD
         Screen::WalletAuditor => draw_wallet_auditor(frame, inner, state),
+=======
+        Screen::NodesManager => draw_nodes_manager(frame, inner, state),
+>>>>>>> origin/feature/dev-alexander
     }
 
     if state.show_file_browser {
         draw_file_browser(frame, inner, state);
-    }
-    if state.show_text_password_prompt {
-        draw_text_password_prompt(frame, inner, state);
     }
     if state.show_matrix_config {
         draw_matrix_config_modal(frame, inner, state);
@@ -5036,7 +4943,7 @@ fn draw_matrix_config_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState)
             }),
         ]),
         Line::from(vec![
-            Span::styled("Simbolos: ", symbols_style),
+            Span::styled("Clave secreta: ", symbols_style),
             Span::raw(symbols),
         ]),
         Line::from(""),
@@ -5049,47 +4956,6 @@ fn draw_matrix_config_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState)
             .border_style(Style::default().fg(Color::Magenta)),
     );
     frame.render_widget(panel, popup);
-}
-
-fn draw_text_password_prompt(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let popup = centered_area(area, 58, 24);
-    frame.render_widget(Clear, popup);
-    let remaining = 3u8.saturating_sub(state.text_password_attempts);
-    let input_mask = "*".repeat(state.text_password_prompt_input.chars().count());
-    let mode = if state.text_password_pending_encrypt {
-        "CIFRAR"
-    } else {
-        "DESCIFRAR"
-    };
-    let body = vec![
-        Line::from(Span::styled(
-            "CONTRASEÑA DETECTADA",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(format!("Operacion pendiente: {}", mode)),
-        Line::from("Inserte la contraseña exacta para continuar."),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Contraseña: ", Style::default().fg(Color::Cyan)),
-            Span::raw(input_mask),
-        ]),
-        Line::from(""),
-        Line::from(format!("Intentos restantes: {}", remaining)),
-        Line::from("Enter valida | Esc cancela | clic abajo valida"),
-    ];
-    let modal = Paragraph::new(body)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .title(" Validacion previa ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(modal, popup);
 }
 
 fn short_hash(value: &str) -> String {
@@ -5406,6 +5272,142 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(list, chunks[1]);
 
     draw_log_box(frame, chunks[2], state);
+}
+
+fn qr_lines(data: &str) -> Vec<Line<'static>> {
+    let code = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(code) => code,
+        Err(_) => return vec![Line::from("QR no disponible para este endpoint")],
+    };
+    let image = code
+        .render::<char>()
+        .quiet_zone(false)
+        .dark_color('#')
+        .light_color(' ')
+        .build();
+
+    let rows: Vec<&str> = image.lines().collect();
+    let mut lines = Vec::new();
+    let mut y = 0;
+    while y < rows.len() {
+        let top = rows[y];
+        let bottom = if y + 1 < rows.len() {
+            Some(rows[y + 1])
+        } else {
+            None
+        };
+        let mut text = String::new();
+        for (x, top_char) in top.chars().enumerate() {
+            let bottom_char = bottom
+                .and_then(|row| row.chars().nth(x))
+                .unwrap_or(' ');
+            let block = match (top_char == '#', bottom_char == '#') {
+                (true, true) => '\u{2588}',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+                (false, false) => ' ',
+            };
+            text.push(block);
+        }
+        lines.push(Line::from(text));
+        y += 2;
+    }
+    lines
+}
+
+fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let header = Paragraph::new("GESTION DE INFRAESTRUCTURA DE NODOS")
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(header, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[1]);
+
+    let items: Vec<ListItem> = if state.nodes_chains.is_empty() {
+        vec![ListItem::new("Sin cadenas registradas en nodes.toml")]
+    } else {
+        state
+            .nodes_chains
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let marker = if idx == state.nodes_selected { ">" } else { " " };
+                ListItem::new(format!("{} {}", marker, name))
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Cadenas registradas ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(list, body[0]);
+
+    let mut detail: Vec<Line> = Vec::new();
+    if let Some(chain) = state.nodes_chains.get(state.nodes_selected) {
+        let endpoints = state.nodes.endpoints(chain);
+        let active = state.nodes.active_index(chain);
+        detail.push(Line::from(Span::styled(
+            format!("Cadena: {}", chain),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        detail.push(Line::from(""));
+        for (idx, endpoint) in endpoints.iter().enumerate() {
+            let marker = if idx == active { "[x]" } else { "[ ]" };
+            let role = if idx == 0 { "principal" } else { "respaldo" };
+            detail.push(Line::from(format!("{} {} ({})", marker, endpoint, role)));
+        }
+        detail.push(Line::from(""));
+        if state.nodes_editing {
+            detail.push(Line::from(Span::styled(
+                format!("Editando endpoint: {}", state.nodes_edit_buffer),
+                Style::default().fg(Color::Green),
+            )));
+        } else if let Some(active_endpoint) = state.nodes.current_endpoint(chain) {
+            detail.push(Line::from("QR del endpoint activo (escanear offline):"));
+            detail.extend(qr_lines(active_endpoint));
+        }
+    } else {
+        detail.push(Line::from("Pulse N en Ajustes para gestionar los nodos."));
+    }
+
+    let detail_panel = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .title(" Detalle del nodo ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail_panel, body[1]);
+
+    let footer = Paragraph::new(
+        "Flechas navegan | Espacio cambia nodo activo | E edita | G guarda | R recarga | Ctrl+C copia | Esc vuelve",
+    )
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(footer, chunks[2]);
 }
 
 fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

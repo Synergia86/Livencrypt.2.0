@@ -10,6 +10,8 @@ pub mod forensics;
 pub mod install_profile;
 pub mod loader;
 pub mod network_profile;
+#[cfg(target_os = "windows")]
+pub mod platform_windows;
 pub mod process_hardening;
 pub mod recovery;
 pub mod sandbox;

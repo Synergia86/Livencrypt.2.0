@@ -533,7 +533,7 @@ fn remove_existing_socket_safely(socket_path: &PathBuf) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn ensure_peer_is_current_user(stream: &UnixStream) -> Result<(), String> {
+pub fn ensure_peer_is_current_user(stream: &UnixStream) -> Result<(), String> {
     use std::mem;
     use std::os::fd::AsRawFd;
 

@@ -7,7 +7,7 @@ use seccompiler::{
     apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
 };
 #[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub const SECCOMP_ENV_FLAG: &str = "LIVENCRYPT_SECCOMP";
 
@@ -16,20 +16,9 @@ pub fn seccomp_requested() -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn target_arch() -> Result<TargetArch, String> {
-    if cfg!(target_arch = "x86_64") {
-        Ok(TargetArch::x86_64)
-    } else if cfg!(target_arch = "aarch64") {
-        Ok(TargetArch::aarch64)
-    } else {
-        Err("arquitectura no soportada por el filtro seccomp".to_string())
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn denied_syscalls() -> Vec<libc::c_long> {
     // Llamadas que comprometen memoria, depuracion o persistencia del nucleo.
-    vec![
+    let mut syscalls = vec![
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
         libc::SYS_process_vm_writev,
@@ -38,8 +27,6 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,
-        libc::SYS_iopl,
-        libc::SYS_ioperm,
         libc::SYS_perf_event_open,
         libc::SYS_personality,
         libc::SYS_mount,
@@ -48,7 +35,16 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_setns,
         libc::SYS_swapon,
         libc::SYS_swapoff,
-    ]
+    ];
+
+    // Acceso directo a puertos de E/S, exclusivo de las arquitecturas x86.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        syscalls.push(libc::SYS_iopl);
+        syscalls.push(libc::SYS_ioperm);
+    }
+
+    syscalls
 }
 
 /// Aplica una lista negra de syscalls peligrosas (acción por defecto permitir,
@@ -57,18 +53,18 @@ fn denied_syscalls() -> Vec<libc::c_long> {
 /// la variable de entorno y puede afinarse a whitelist tras pruebas en destino.
 #[cfg(target_os = "linux")]
 pub fn apply_syscall_denylist() -> Result<(), String> {
-    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let mut rules: HashMap<i32, Vec<SeccompRule>> = HashMap::new();
     for syscall in denied_syscalls() {
         rules.insert(syscall, Vec::new());
+        rules.insert(syscall as i32, Vec::new());
     }
 
-    let filter = SeccompFilter::new(
-        rules,
-        SeccompAction::Allow,
-        SeccompAction::KillProcess,
-        target_arch()?,
-    )
-    .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
+    let target_arch: TargetArch = std::env::consts::ARCH
+        .try_into()
+        .map_err(|_| "arquitectura no soportada por el filtro seccomp".to_string())?;
+
+    let filter = SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Trap, target_arch)
+        .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
 
     let program: BpfProgram = filter
         .try_into()

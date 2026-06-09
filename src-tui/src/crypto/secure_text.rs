@@ -8,12 +8,12 @@ use chacha20poly1305::{
     Key, XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
+use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroize;
 
 const MAGIC: &[u8; 4] = b"LVCT";
 const SALT_LEN: usize = 32;
 const NONCE_LEN: usize = 24;
-const MIN_SECRET_CHARS: usize = 12;
 
 fn argon2id() -> Result<Argon2<'static>, String> {
     let params = Params::new(131_072, 3, 1, Some(32))
@@ -22,16 +22,14 @@ fn argon2id() -> Result<Argon2<'static>, String> {
 }
 
 fn derive_key(secret: &str, salt: &[u8]) -> Result<[u8; 32], String> {
-    if secret.trim().chars().count() < MIN_SECRET_CHARS {
-        return Err(format!(
-            "la clave de texto debe tener al menos {} caracteres",
-            MIN_SECRET_CHARS
-        ));
-    }
+    // Normalizacion NFC: dos cadenas visualmente identicas con distinta composicion
+    // Unicode deben derivar la misma clave. Sin validacion de longitud minima: el
+    // motor Argon2id acepta cualquier tamano sin filtrar para no exponer canal lateral.
+    let mut normalized: String = secret.nfc().collect();
     let mut key = [0u8; 32];
-    argon2id()?
-        .hash_password_into(secret.as_bytes(), salt, &mut key)
-        .map_err(|error| format!("no se pudo derivar la clave de texto: {}", error))?;
+    let result = argon2id()?.hash_password_into(normalized.as_bytes(), salt, &mut key);
+    normalized.zeroize();
+    result.map_err(|error| format!("no se pudo derivar la clave de texto: {}", error))?;
     Ok(key)
 }
 
@@ -120,7 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn secure_text_rejects_short_secret() {
-        assert!(encrypt_text("mensaje", "corta").is_err());
+    fn secure_text_accepts_any_secret_length() {
+        let token = encrypt_text("dato", "ab").expect("cifrar clave corta");
+        assert_eq!(decrypt_text(&token, "ab").expect("descifrar"), "dato");
     }
 }

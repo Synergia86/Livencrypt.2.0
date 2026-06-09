@@ -272,6 +272,9 @@ impl GatewaySupervisor {
         for stream in listener.incoming() {
             let mut stream =
                 stream.map_err(|error| format!("conexion IPC entrante invalida: {}", error))?;
+            if crate::crypto::blockchain::worker::ensure_peer_is_current_user(&stream).is_err() {
+                continue;
+            }
             let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
             let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(200)));
             let payload = read_native_message(&mut stream)?;
