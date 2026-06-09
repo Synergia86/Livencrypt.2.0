@@ -2,11 +2,11 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: despachador dinámico de nodos de infraestructura desde nodes.toml */
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChainNodesConfig {
     name: String,
     primary: String,
@@ -14,10 +14,17 @@ struct ChainNodesConfig {
     fallbacks: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct NodesFile {
     #[serde(default)]
     chain: Vec<ChainNodesConfig>,
+}
+
+/// Ruta por defecto del catálogo de nodos en el directorio local de datos.
+pub fn default_nodes_path() -> PathBuf {
+    crate::livencrypt_base_dir()
+        .join(".livencrypt")
+        .join("nodes.toml")
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +93,69 @@ impl NodeRegistry {
             .get(&chain.to_lowercase())
             .map(|entry| entry.endpoints.clone())
             .unwrap_or_default()
+    }
+
+    pub fn chain_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.chains.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    pub fn active_index(&self, chain: &str) -> usize {
+        self.chains
+            .get(&chain.to_lowercase())
+            .map(|entry| entry.active)
+            .unwrap_or(0)
+    }
+
+    /// Define el endpoint principal de una cadena, creándola si no existe.
+    pub fn set_primary(&mut self, chain: &str, url: &str) {
+        let url = url.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        let key = chain.to_lowercase();
+        match self.chains.get_mut(&key) {
+            Some(entry) => {
+                if entry.endpoints.is_empty() {
+                    entry.endpoints.push(url);
+                } else {
+                    entry.endpoints[0] = url;
+                }
+                entry.active = 0;
+            }
+            None => {
+                self.chains.insert(
+                    key,
+                    ChainNodes {
+                        endpoints: vec![url],
+                        active: 0,
+                    },
+                );
+            }
+        }
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<(), String> {
+        let mut chain = Vec::new();
+        for name in self.chain_names() {
+            if let Some(entry) = self.chains.get(&name) {
+                let mut endpoints = entry.endpoints.iter();
+                let primary = endpoints.next().cloned().unwrap_or_default();
+                chain.push(ChainNodesConfig {
+                    name,
+                    primary,
+                    fallbacks: endpoints.cloned().collect(),
+                });
+            }
+        }
+        let serialized = toml::to_string(&NodesFile { chain })
+            .map_err(|error| format!("no se pudo serializar nodes.toml: {}", error))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(path, serialized)
+            .map_err(|error| format!("no se pudo escribir nodes.toml: {}", error))
     }
 }
 

@@ -13,6 +13,7 @@ use crossterm::terminal::{
 use livencrypt_lib::crypto::blockchain::breaker::GatewaySecurityState;
 use livencrypt_lib::crypto::blockchain::firewall::{FirewallRules, LiveFirewall};
 use livencrypt_lib::crypto::blockchain::multi_curve::UniversalKeymaster;
+use livencrypt_lib::crypto::blockchain::nodes::{self, NodeRegistry};
 use livencrypt_lib::crypto::blockchain::supervisor::GatewaySupervisor;
 use livencrypt_lib::crypto::blockchain::worker::{
     Web3BackgroundWorker, Web3WorkerCmd, Web3WorkerEvent,
@@ -378,6 +379,7 @@ enum Screen {
     RecoveryMode,
     InstallProfile,
     WalletGateway,
+    NodesManager,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -596,6 +598,11 @@ struct TuiState {
     text_password_pending_encrypt: bool,
     text_password_attempts: u8,
     text_internal_clipboard: String,
+    nodes: NodeRegistry,
+    nodes_chains: Vec<String>,
+    nodes_selected: usize,
+    nodes_editing: bool,
+    nodes_edit_buffer: String,
 
     file_input_path: String,
     file_output_path: String,
@@ -703,6 +710,11 @@ impl TuiState {
             text_password_pending_encrypt: true,
             text_password_attempts: 0,
             text_internal_clipboard: String::new(),
+            nodes: NodeRegistry::default(),
+            nodes_chains: Vec::new(),
+            nodes_selected: 0,
+            nodes_editing: false,
+            nodes_edit_buffer: String::new(),
             file_input_path: String::new(),
             file_output_path: String::new(),
             file_cajas: default_boxes(),
@@ -1380,6 +1392,7 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         Screen::RecoveryMode => handle_recovery_key(state, key),
         Screen::InstallProfile => handle_back_to_dashboard_key(state, key),
         Screen::WalletGateway => handle_wallet_gateway_key(state, key),
+        Screen::NodesManager => handle_nodes_manager_key(state, key),
     }
 }
 
@@ -1504,7 +1517,8 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         | Screen::FirmwareStaging
         | Screen::SandboxManager
         | Screen::RecoveryMode
-        | Screen::InstallProfile => {
+        | Screen::InstallProfile
+        | Screen::NodesManager => {
             if mouse.row <= inner.y + 1 {
                 state.screen = Screen::Dashboard;
             }
@@ -2045,6 +2059,109 @@ fn handle_dashboard_key(state: &mut TuiState, key: KeyEvent) {
 fn handle_back_to_dashboard_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
+        _ => {}
+    }
+}
+
+fn reload_nodes_manager(state: &mut TuiState) {
+    state.nodes = NodeRegistry::load_from_path(&nodes::default_nodes_path());
+    state.nodes_chains = state.nodes.chain_names();
+    if state.nodes_chains.is_empty() {
+        state.nodes_selected = 0;
+    } else if state.nodes_selected >= state.nodes_chains.len() {
+        state.nodes_selected = state.nodes_chains.len() - 1;
+    }
+}
+
+fn handle_nodes_manager_key(state: &mut TuiState, key: KeyEvent) {
+    if state.nodes_editing {
+        match key.code {
+            KeyCode::Esc => {
+                state.nodes_edit_buffer.zeroize();
+                state.nodes_edit_buffer.clear();
+                state.nodes_editing = false;
+                state.status = "Edicion cancelada.".to_string();
+            }
+            KeyCode::Backspace => {
+                state.nodes_edit_buffer.pop();
+            }
+            KeyCode::Enter => {
+                if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                    let url = state.nodes_edit_buffer.clone();
+                    state.nodes.set_primary(&chain, &url);
+                    state.status = format!("Endpoint principal actualizado para {}.", chain);
+                }
+                state.nodes_edit_buffer.zeroize();
+                state.nodes_edit_buffer.clear();
+                state.nodes_editing = false;
+            }
+            KeyCode::Char(value) => state.nodes_edit_buffer.push(value),
+            _ => {}
+        }
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc => {
+            state.nodes_edit_buffer.zeroize();
+            state.nodes_edit_buffer.clear();
+            state.screen = Screen::Dashboard;
+        }
+        KeyCode::Up => {
+            state.nodes_selected = state.nodes_selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            if state.nodes_selected + 1 < state.nodes_chains.len() {
+                state.nodes_selected += 1;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                match state.nodes.switch_to_fallback(&chain) {
+                    Some(endpoint) => {
+                        state.status = format!("{} ahora enruta por {}.", chain, endpoint)
+                    }
+                    None => {
+                        state.status =
+                            "Sin nodo de respaldo registrado para esta cadena.".to_string()
+                    }
+                }
+            }
+        }
+        KeyCode::Char('E') | KeyCode::Char('e') => {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                let current = state
+                    .nodes
+                    .current_endpoint(&chain)
+                    .unwrap_or_default()
+                    .to_string();
+                state.nodes_edit_buffer = current;
+                state.nodes_editing = true;
+                state.status =
+                    "Editando endpoint principal. Enter guarda, Esc cancela.".to_string();
+            }
+        }
+        KeyCode::Char('R') | KeyCode::Char('r') => {
+            reload_nodes_manager(state);
+            state.status = "Catalogo de nodos recargado desde disco.".to_string();
+        }
+        KeyCode::Char('G') | KeyCode::Char('g') => {
+            match state.nodes.save_to_path(&nodes::default_nodes_path()) {
+                Ok(()) => state.status = "nodes.toml guardado en disco.".to_string(),
+                Err(error) => state.status = format!("Error guardando nodes.toml: {}", error),
+            }
+        }
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Some(chain) = state.nodes_chains.get(state.nodes_selected).cloned() {
+                if let Some(endpoint) = state.nodes.current_endpoint(&chain) {
+                    let endpoint = endpoint.to_string();
+                    let _ = write_system_clipboard(&endpoint);
+                    state.status = "Endpoint copiado al portapapeles.".to_string();
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -3513,6 +3630,10 @@ fn append_unique_until_limit(target: &mut Vec<String>, values: Vec<String>, limi
 fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => state.screen = Screen::Dashboard,
+        KeyCode::Char('N') => {
+            state.screen = Screen::NodesManager;
+            reload_nodes_manager(state);
+        }
         KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % 10,
         KeyCode::BackTab => {
             state.settings_focus = if state.settings_focus == 0 {
@@ -3759,6 +3880,7 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
         Screen::RecoveryMode => draw_recovery_mode(frame, inner, state),
         Screen::InstallProfile => draw_install_profile(frame, inner),
         Screen::WalletGateway => draw_wallet_gateway(frame, inner, state),
+        Screen::NodesManager => draw_nodes_manager(frame, inner, state),
     }
 
     if state.show_file_browser {
@@ -4272,6 +4394,142 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(list, chunks[1]);
 
     draw_log_box(frame, chunks[2], state);
+}
+
+fn qr_lines(data: &str) -> Vec<Line<'static>> {
+    let code = match qrcode::QrCode::new(data.as_bytes()) {
+        Ok(code) => code,
+        Err(_) => return vec![Line::from("QR no disponible para este endpoint")],
+    };
+    let image = code
+        .render::<char>()
+        .quiet_zone(false)
+        .dark_color('#')
+        .light_color(' ')
+        .build();
+
+    let rows: Vec<&str> = image.lines().collect();
+    let mut lines = Vec::new();
+    let mut y = 0;
+    while y < rows.len() {
+        let top = rows[y];
+        let bottom = if y + 1 < rows.len() {
+            Some(rows[y + 1])
+        } else {
+            None
+        };
+        let mut text = String::new();
+        for (x, top_char) in top.chars().enumerate() {
+            let bottom_char = bottom
+                .and_then(|row| row.chars().nth(x))
+                .unwrap_or(' ');
+            let block = match (top_char == '#', bottom_char == '#') {
+                (true, true) => '\u{2588}',
+                (true, false) => '\u{2580}',
+                (false, true) => '\u{2584}',
+                (false, false) => ' ',
+            };
+            text.push(block);
+        }
+        lines.push(Line::from(text));
+        y += 2;
+    }
+    lines
+}
+
+fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let header = Paragraph::new("GESTION DE INFRAESTRUCTURA DE NODOS")
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(header, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .split(chunks[1]);
+
+    let items: Vec<ListItem> = if state.nodes_chains.is_empty() {
+        vec![ListItem::new("Sin cadenas registradas en nodes.toml")]
+    } else {
+        state
+            .nodes_chains
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| {
+                let marker = if idx == state.nodes_selected { ">" } else { " " };
+                ListItem::new(format!("{} {}", marker, name))
+            })
+            .collect()
+    };
+    let list = List::new(items).block(
+        Block::default()
+            .title(" Cadenas registradas ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(list, body[0]);
+
+    let mut detail: Vec<Line> = Vec::new();
+    if let Some(chain) = state.nodes_chains.get(state.nodes_selected) {
+        let endpoints = state.nodes.endpoints(chain);
+        let active = state.nodes.active_index(chain);
+        detail.push(Line::from(Span::styled(
+            format!("Cadena: {}", chain),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )));
+        detail.push(Line::from(""));
+        for (idx, endpoint) in endpoints.iter().enumerate() {
+            let marker = if idx == active { "[x]" } else { "[ ]" };
+            let role = if idx == 0 { "principal" } else { "respaldo" };
+            detail.push(Line::from(format!("{} {} ({})", marker, endpoint, role)));
+        }
+        detail.push(Line::from(""));
+        if state.nodes_editing {
+            detail.push(Line::from(Span::styled(
+                format!("Editando endpoint: {}", state.nodes_edit_buffer),
+                Style::default().fg(Color::Green),
+            )));
+        } else if let Some(active_endpoint) = state.nodes.current_endpoint(chain) {
+            detail.push(Line::from("QR del endpoint activo (escanear offline):"));
+            detail.extend(qr_lines(active_endpoint));
+        }
+    } else {
+        detail.push(Line::from("Pulse N en Ajustes para gestionar los nodos."));
+    }
+
+    let detail_panel = Paragraph::new(detail)
+        .block(
+            Block::default()
+                .title(" Detalle del nodo ")
+                .borders(Borders::ALL),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(detail_panel, body[1]);
+
+    let footer = Paragraph::new(
+        "Flechas navegan | Espacio cambia nodo activo | E edita | G guarda | R recarga | Ctrl+C copia | Esc vuelve",
+    )
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray)),
+    );
+    frame.render_widget(footer, chunks[2]);
 }
 
 fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {

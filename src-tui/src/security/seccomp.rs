@@ -35,8 +35,8 @@ fn denied_syscalls() -> Vec<libc::c_long> {
         libc::SYS_swapoff,
     ];
 
-    // Acceso directo a puertos de E/S, exclusivo de la arquitectura amd64.
-    #[cfg(target_arch = "x86_64")]
+    // Acceso directo a puertos de E/S, exclusivo de las arquitecturas x86.
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         syscalls.push(libc::SYS_iopl);
         syscalls.push(libc::SYS_ioperm);
