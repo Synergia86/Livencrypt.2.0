@@ -1,6 +1,6 @@
 # Livencrypt 2.0
 
-Livencrypt 2.0 es una suite criptográfica avanzada de confianza cero (zero-trust) y **pasarela de custodia universal** diseñada en Rust para operar de manera local y descentralizada a través de una interfaz interactiva de terminal (TUI). El sistema proporciona un entorno fortificado para el cifrado posicional de datos, la gestión de almacenamiento criptográfico blindado en memoria volátil y la **intermediación segura de operaciones Web3** con navegadores web (compatibles con dApps como Dextools, Uniswap, etc.) mediante una extensión EIP-1193 y canales de comunicación aislados (IPC). Incluye un **auditor visual de direcciones públicas** y un **registro de auditoría firmado** a prueba de manipulaciones.
+Livencrypt 2.0 es una suite criptográfica avanzada de confianza cero (zero-trust) y **pasarela de custodia universal** diseñada en Rust para operar de manera local y descentralizada a través de una interfaz interactiva de terminal (TUI). El sistema proporciona un entorno fortificado para el cifrado posicional de datos, la gestión de almacenamiento criptográfico blindado en memoria volátil y la **intermediación segura de operaciones Web3** con navegadores web (compatible con dApps mediante el estándar EIP-1193) a través de una extensión y canales de comunicación aislados (IPC). Incluye un **auditor visual de direcciones públicas** y un **registro de auditoría firmado** a prueba de manipulaciones.
 
 ## 1. Arquitectura y modelo de confianza cero
 
@@ -88,11 +88,11 @@ Cada solicitud de firma supera una evaluación lineal antes de exponer material 
 - **Registro Web3 encadenado y firmado (Ed25519):** cada decisión se enlaza por hash y se firma con una clave de dispositivo derivada del vault; eleva la garantía de "detecta edición parcial" a "detecta reescritura total". Verificable desde la UI (`V` en el Monitor de Auditoría).
 - **Verificador de credenciales read-only sin efectos** para re-confirmaciones de identidad (un fallo no toca el contador del vault), con **opción destructiva configurable** (Ajustes, tecla `Z`) para quien mantiene backup externo.
 
-### G. Extensión Web3 EIP-1193 (para Dextools y dApps)
+### G. Extensión Web3 EIP-1193 (para dApps)
 - Proveedor `window.ethereum`/`window.livencrypt` (Manifest V3) que enruta cada método al núcleo seguro vía host nativo `com.livencrypt.gateway`.
 - Allowlist de orígenes por dominio (TTL 24 h, por método); errores normalizados EIP-1193 (`4001/4100/4200/4900`).
 - Métodos operativos: `eth_requestAccounts`, `eth_accounts`, `eth_chainId`, `net_version`, `eth_getBalance`, `eth_getTransactionCount`, `eth_gasPrice`, `livencrypt_prepareTransaction`, `eth_sendTransaction`, `livencrypt_status`.
-- Pendientes (hoja de ruta): `eth_estimateGas`, `personal_sign`, `eth_signTypedData_v4` (EIP-712/Permit2) y conmutación multicadena. Detalle de uso con Dextools en `DOCS/UTILIDAD_LIVENCRYPT_PARA_DEXTOOLS.md` (local).
+- Pendientes (hoja de ruta): `eth_estimateGas`, `personal_sign`, `eth_signTypedData_v4` (EIP-712/Permit2) y conmutación multicadena.
 
 ### H. Blindaje del sistema operativo y memoria
 - **Process Hardening:** `libc::prctl` deshabilita volcados (`PR_SET_DUMPABLE = 0`), restringe ptrace y fija `RLIMIT_CORE = 0`.
@@ -160,7 +160,7 @@ sudo dpkg -i target/debian/livencrypt-core_2.11.0_amd64.deb
 
 Al instalar, las utilidades configuran de forma atómica: límites del sistema (`99-livencrypt.conf`, core 0 + mlock), confinamiento AppArmor (`usr.bin.livencrypt-core`) y el registro del manifiesto de mensajería nativa (`com.livencrypt.gateway.json`) en Chrome/Chromium/Brave.
 
-**Extensión Web3:** cargar `src-tui/extension/livencrypt-web3/` en el navegador (modo desarrollador) y aprobar el dominio de la dApp (p. ej. `dextools.io`) la primera vez.
+**Extensión Web3:** cargar `src-tui/extension/livencrypt-web3/` en el navegador (modo desarrollador) y aprobar el dominio de la dApp la primera vez.
 
 ## 5. Uso básico
 
