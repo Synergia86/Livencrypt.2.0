@@ -9,8 +9,8 @@
 # snapshots / indices de herramientas
 *.snapshot
 
-# copia anidada de proyecto de referencia dentro de DOCS (bloat/binarios, no es codigo del repo)
-DOCS/LIVENCRYPT 2.0/
+# documentacion local: no se versiona en el repositorio
+/DOCS/
 
 # notas y utilidades locales (no forman parte del proyecto)
 /Codex_sesión.txt
