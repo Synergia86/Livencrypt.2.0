@@ -1,0 +1,48 @@
+{
+  "manifest_version": 3,
+  "name": "Livencrypt Web3 Bridge",
+  "version": "0.2.0",
+  "description": "Proveedor Web3 local para Livencrypt 2.0 mediante livencrypt-bridge.",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "inject.js"
+      ],
+      "matches": [
+        "https://*/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
+      ]
+    }
+  ],
+  "action": {
+    "default_title": "Livencrypt Web3",
+    "default_popup": "popup.html"
+  }
+}

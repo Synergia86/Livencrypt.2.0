@@ -10,12 +10,17 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use livencrypt_lib::crypto::blockchain::address::{self, Network};
 use livencrypt_lib::crypto::blockchain::breaker::GatewaySecurityState;
 use livencrypt_lib::crypto::blockchain::firewall::{FirewallRules, LiveFirewall};
 use livencrypt_lib::crypto::blockchain::multi_curve::UniversalKeymaster;
 use livencrypt_lib::crypto::blockchain::nodes::{self, NodeRegistry};
+use livencrypt_lib::crypto::blockchain::rpc_manager;
 use livencrypt_lib::crypto::blockchain::supervisor::GatewaySupervisor;
-use livencrypt_lib::crypto::blockchain::types::{ChainType, SigningRequestPreview};
+use livencrypt_lib::crypto::blockchain::types::{
+    AccountPolicy, BroadcastRequestPreview, ChainType, PolicyWindow, PriceQuote, ScheduledPolicy,
+    SigningRequestPreview, Web3ConnectivityProfile,
+};
 use livencrypt_lib::crypto::blockchain::worker::{
     Web3BackgroundWorker, Web3WorkerCmd, Web3WorkerEvent,
 };
@@ -30,7 +35,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use rust_decimal::Decimal;
+use sha2::Sha256;
 use sha3::{Digest, Keccak256};
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -84,8 +91,215 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    if args.iter().any(|arg| arg == "--web3-real-check") {
+        return run_web3_real_check().map_err(Into::into);
+    }
+
     livencrypt_lib::initialize_core();
     run_terminal_ui()
+}
+
+fn run_web3_real_check() -> Result<(), String> {
+    println!("LIVENCRYPT WEB3 REAL CHECK");
+    println!("Alcance: nodos blockchain publicos de lectura, derivacion local y QR publico.");
+    println!("Excluido: nmcli, firewall del SO, AppArmor operativo, broadcast y firma real.");
+    println!();
+
+    let keymaster = UniversalKeymaster::new(
+        [101, 202, 303, 404, 505],
+        "LIVENCRYPT-WEB3-REAL-CHECK-NO-USAR-EN-PRODUCCION",
+    )?;
+    for chain in [ChainType::Bitcoin, ChainType::Ethereum, ChainType::Solana] {
+        for index in 0..2 {
+            let started = Instant::now();
+            match keymaster.get_public_key(&chain, Network::Mainnet, 0, index) {
+                Ok(public_key) => {
+                    let address = public_key_address_label(&chain, &public_key, Network::Mainnet);
+                    let payload =
+                        wallet_link_payload_for_check(&chain, 0, index, &address, &public_key);
+                    println!(
+                        "WALLET {:?} cuenta=0 indice={} generada en {}ms",
+                        chain,
+                        index,
+                        started.elapsed().as_millis()
+                    );
+                    println!("direccion: {}", address);
+                    println!("payload-extension: {}", payload);
+                    println!("QR ASCII: {}", qr_ascii_summary(&payload));
+                    println!();
+                }
+                Err(error) => {
+                    println!(
+                        "WALLET {:?} cuenta=0 indice={} ERROR: {}",
+                        chain, index, error
+                    );
+                }
+            }
+        }
+    }
+
+    let mut registry = NodeRegistry::default();
+    registry.set_profile(Web3ConnectivityProfile::RpcReadOnly);
+    registry.set_primary("ethereum", "https://ethereum-rpc.publicnode.com");
+    registry.set_primary("solana", "https://api.mainnet-beta.solana.com");
+    registry.set_primary("bitcoin", "https://bitcoin-rpc.publicnode.com");
+
+    println!("RPC PROFILE: {}", registry.profile().label());
+    println!("{}", registry.connectivity_summary());
+    println!();
+
+    run_rpc_probe(
+        &registry,
+        "ethereum",
+        "0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045",
+        "ETH",
+        Some("0x0000000000000000000000000000000000000000000000000000000000000000"),
+    );
+    run_rpc_probe(
+        &registry,
+        "solana",
+        "11111111111111111111111111111111",
+        "SOL",
+        None,
+    );
+    run_rpc_probe(
+        &registry,
+        "bitcoin",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "BTC",
+        None,
+    );
+
+    match rpc_manager::verified_clock_from_nodes(&registry, &["ethereum", "solana", "bitcoin"]) {
+        Ok(clock) => println!(
+            "RELOJ VERIFICADO: local={} consenso={:?} drift={:?}s estado={}",
+            clock.local_unix, clock.consensus_unix, clock.drift_seconds, clock.status
+        ),
+        Err(error) => println!("RELOJ VERIFICADO ERROR: {}", error),
+    }
+
+    println!();
+    println!("DEX/EXTENSION CHECK:");
+    println!("OK: se genera payload publico livencrypt-wallet-link por wallet.");
+    println!("OK: el bridge nativo puede exponer clave publica/direccion sin secreto.");
+    println!("LIMITACION: MetaMask no acepta este payload directamente; requiere extension Livencrypt o adaptador EIP-1193 propio.");
+    println!(
+        "OK: Bitcoin genera direccion publica P2PKH valida desde la clave publica comprimida."
+    );
+    println!(
+        "LIMITACION: Monero/ZCash/Starknet no tienen adaptador de derivacion/RPC en este binario."
+    );
+
+    Ok(())
+}
+
+fn wallet_link_payload_for_check(
+    chain: &ChainType,
+    account: u32,
+    index: u32,
+    address: &str,
+    public_key: &[u8],
+) -> String {
+    serde_json::json!({
+        "type": "livencrypt-wallet-link",
+        "version": 1,
+        "chain": format!("{:?}", chain),
+        "account": account,
+        "address_index": index,
+        "derivation_path": derivation_path_label(chain, account, index),
+        "address": address,
+        "public_key_hex": hex::encode(public_key),
+        "scope": "public-address-only",
+        "warning": "No contiene clave privada ni frase secreta"
+    })
+    .to_string()
+}
+
+fn qr_ascii_summary(payload: &str) -> String {
+    let qr = render_ascii_qr(payload);
+    let lines = qr.lines().count();
+    let chars = qr.chars().count();
+    let digest = Sha256::digest(qr.as_bytes());
+    format!(
+        "OK lineas={} chars={} sha256={}",
+        lines,
+        chars,
+        hex::encode(&digest[..8])
+    )
+}
+
+fn render_ascii_qr(payload: &str) -> String {
+    match qrcode::QrCode::new(payload.as_bytes()) {
+        Ok(code) => code
+            .render::<char>()
+            .quiet_zone(false)
+            .module_dimensions(2, 1)
+            .dark_color('█')
+            .light_color(' ')
+            .build(),
+        Err(error) => format!("QR ERROR: {}", error),
+    }
+}
+
+fn run_rpc_probe(
+    registry: &NodeRegistry,
+    chain: &str,
+    address: &str,
+    asset: &str,
+    txid: Option<&str>,
+) {
+    println!("RPC {}", chain);
+    let adapter = match rpc_manager::adapter_for_chain(registry, chain) {
+        Ok(adapter) => adapter,
+        Err(error) => {
+            println!("  ADAPTADOR ERROR: {}", error);
+            println!();
+            return;
+        }
+    };
+
+    match adapter.health() {
+        Ok(health) => println!(
+            "  HEALTH OK endpoint={} network={} altura={:?} latencia={}ms",
+            health.endpoint, health.network_id, health.block_height_or_slot, health.latency_ms
+        ),
+        Err(error) => println!("  HEALTH ERROR: {}", error),
+    }
+    match adapter.read_chain_clock() {
+        Ok(clock) => println!(
+            "  CLOCK OK altura={:?} chain_unix={:?} drift={:?}",
+            clock.block_height_or_slot, clock.chain_unix, clock.drift_seconds
+        ),
+        Err(error) => println!("  CLOCK ERROR: {}", error),
+    }
+    match adapter.read_balance(address, asset) {
+        Ok(balance) => println!(
+            "  BALANCE OK {} {} raw={} endpoint={}",
+            balance.amount, balance.asset, balance.raw_amount, balance.endpoint
+        ),
+        Err(error) => println!("  BALANCE ERROR: {}", error),
+    }
+    match adapter.read_nonce(address) {
+        Ok(nonce) => println!("  NONCE OK {}", nonce.nonce),
+        Err(error) => println!("  NONCE ERROR: {}", error),
+    }
+    match adapter.estimate_fee(&[]) {
+        Ok(fee) => println!(
+            "  FEE OK {} {} raw={} source={}",
+            fee.fee_amount, fee.asset, fee.raw_fee, fee.source
+        ),
+        Err(error) => println!("  FEE ERROR: {}", error),
+    }
+    if let Some(txid) = txid {
+        match adapter.read_transaction_status(txid) {
+            Ok(status) => println!(
+                "  TX OK confirmado={} bloque={:?} success={:?}",
+                status.confirmed, status.block_height_or_slot, status.success
+            ),
+            Err(error) => println!("  TX ERROR: {}", error),
+        }
+    }
+    println!();
 }
 
 fn run_container_network_self_test() -> Result<(), String> {
@@ -387,6 +601,11 @@ enum Screen {
     WalletGateway,
     WalletAuditor,
     NodesManager,
+    Web3AccountPolicies,
+    Web3ScheduledRules,
+    Web3PriceOracle,
+    Web3RpcInspector,
+    Web3AccountEditor,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -572,6 +791,14 @@ struct FileJobResult {
     result: Result<Option<security::forensics::ForensicReport>, String>,
 }
 
+/// Accion del auditor en espera de re-confirmacion Boot Shield (gate C.4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingAction {
+    AuditorDerive,
+    AuditorVerify,
+    AuditorCopy,
+}
+
 struct TuiState {
     screen: Screen,
     cajas: [String; 5],
@@ -606,7 +833,6 @@ struct TuiState {
     show_text_password_prompt: bool,
     text_password_prompt_input: String,
     text_password_expected: String,
-    text_password_pending_encrypt: bool,
     text_password_attempts: u8,
     text_internal_clipboard: String,
     nodes: NodeRegistry,
@@ -628,6 +854,9 @@ struct TuiState {
     file_browser: FileBrowser,
     processing_progress: Arc<AtomicU64>,
     is_processing: bool,
+    last_click_millis: u128,
+    last_click_col: u16,
+    last_click_row: u16,
     file_job_rx: Option<mpsc::Receiver<FileJobResult>>,
     last_forensic_report: Option<security::forensics::ForensicReport>,
     last_forensic_report_path: Option<PathBuf>,
@@ -657,6 +886,7 @@ struct TuiState {
     settings_boot_template: String,
     settings_network_profile: String,
     settings_network_confirmation: String,
+    settings_destructive_auditor_reauth: bool,
     inactivity_enabled: bool,
     inactivity_timeout_seconds: u64,
     settings_focus: usize,
@@ -667,13 +897,30 @@ struct TuiState {
     cached_gateway_state: GatewaySecurityState,
     cached_tx_count: u32,
     cached_volume_units: Decimal,
+    cached_fiat_value: Decimal,
     allowed_dex_contracts: Vec<String>,
     allowed_cex_destinations: Vec<String>,
+    account_policies: Vec<AccountPolicy>,
+    price_quotes: Vec<PriceQuote>,
     system_notification: String,
     pending_signing_preview: Option<SigningRequestPreview>,
+    pending_broadcast_preview: Option<BroadcastRequestPreview>,
+    last_identity_confirmation_unix: u64,
+    show_reauth_modal: bool,
+    pending_action_after_reauth: Option<PendingAction>,
+    reauth_cajas: [String; 5],
+    reauth_phrase: String,
+    reauth_secondary_cajas: [String; 5],
+    reauth_secondary_phrase: String,
+    reauth_focus: usize,
     gateway_focused_field: usize,
+    gateway_network: Network,
     input_max_tx: String,
     input_max_volume: String,
+    input_max_fiat_value: String,
+    input_fiat_currency: String,
+    input_price_asset: String,
+    input_price_value: String,
     input_new_dex_id: String,
     input_new_cex_id: String,
     show_breaker_reset: bool,
@@ -681,12 +928,59 @@ struct TuiState {
     reset_phrase: String,
     reset_focus_index: usize,
     auditor_chain_index: usize,
+    auditor_network: Network,
     auditor_account_index: String,
     auditor_address_index: String,
     auditor_focus: usize,
     auditor_public_key_hex: String,
     auditor_address: String,
+    auditor_segwit_address: String,
+    auditor_expected_input: String,
+    auditor_match_status: String,
     auditor_status: String,
+    web3_policy_selected: usize,
+    web3_policy_focus: usize,
+    web3_policy_chain_index: usize,
+    web3_policy_account_index: String,
+    web3_policy_address_index: String,
+    web3_policy_label: String,
+    web3_policy_max_tx: String,
+    web3_policy_max_crypto: String,
+    web3_policy_max_fiat: String,
+    web3_policy_fiat_currency: String,
+    web3_policy_require_confirmation: bool,
+    web3_policy_destination_input: String,
+    web3_policy_contract_input: String,
+    web3_policy_asset_input: String,
+    web3_policy_asset_limit_input: String,
+    web3_schedule_selected: usize,
+    web3_schedule_focus: usize,
+    web3_schedule_name: String,
+    web3_schedule_asset: String,
+    web3_schedule_destination: String,
+    web3_schedule_max_tx: String,
+    web3_schedule_max_asset: String,
+    web3_schedule_max_fiat: String,
+    web3_schedule_currency: String,
+    web3_schedule_window: String,
+    web3_schedule_expires_unix: String,
+    web3_price_focus: usize,
+    web3_price_selected: usize,
+    web3_price_asset: String,
+    web3_price_fiat: String,
+    web3_price_value: String,
+    web3_price_source: String,
+    web3_price_max_age_seconds: String,
+    web3_price_import_path: String,
+    web3_rpc_focus: usize,
+    web3_rpc_chain_index: usize,
+    web3_rpc_address: String,
+    web3_rpc_asset: String,
+    web3_rpc_status: String,
+    web3_rpc_balance: String,
+    web3_rpc_nonce: String,
+    web3_rpc_fee: String,
+    web3_rpc_tx_status: String,
     sandbox_payload_path: String,
     sandbox_memory_mib: String,
     sandbox_cpu_seconds: String,
@@ -743,10 +1037,9 @@ impl TuiState {
             show_text_password_prompt: false,
             text_password_prompt_input: String::new(),
             text_password_expected: String::new(),
-            text_password_pending_encrypt: true,
             text_password_attempts: 0,
             text_internal_clipboard: String::new(),
-            nodes: NodeRegistry::default(),
+            nodes: NodeRegistry::load_from_path(&nodes::default_nodes_path()),
             nodes_chains: Vec::new(),
             nodes_selected: 0,
             nodes_editing: false,
@@ -764,6 +1057,9 @@ impl TuiState {
             file_browser: FileBrowser::new(),
             processing_progress: Arc::new(AtomicU64::new(0)),
             is_processing: false,
+            last_click_millis: 0,
+            last_click_col: 0,
+            last_click_row: 0,
             file_job_rx: None,
             last_forensic_report: None,
             last_forensic_report_path: None,
@@ -794,6 +1090,7 @@ impl TuiState {
             settings_network_profile: security::get_network_profile()
                 .unwrap_or_else(|_| "mock".to_string()),
             settings_network_confirmation: String::new(),
+            settings_destructive_auditor_reauth: false,
             inactivity_enabled: false,
             inactivity_timeout_seconds: 300,
             settings_focus: 0,
@@ -806,13 +1103,30 @@ impl TuiState {
             },
             cached_tx_count: 0,
             cached_volume_units: Decimal::ZERO,
+            cached_fiat_value: Decimal::ZERO,
             allowed_dex_contracts: Vec::new(),
             allowed_cex_destinations: Vec::new(),
+            account_policies: Vec::new(),
+            price_quotes: Vec::new(),
             system_notification: "Pasarela Web3 pendiente de desbloqueo Boot Shield.".to_string(),
             pending_signing_preview: None,
+            pending_broadcast_preview: None,
+            last_identity_confirmation_unix: 0,
+            show_reauth_modal: false,
+            pending_action_after_reauth: None,
+            reauth_cajas: empty_boxes(),
+            reauth_phrase: String::new(),
+            reauth_secondary_cajas: empty_boxes(),
+            reauth_secondary_phrase: String::new(),
+            reauth_focus: 0,
             gateway_focused_field: 0,
+            gateway_network: Network::Mainnet,
             input_max_tx: "10".to_string(),
             input_max_volume: "5000".to_string(),
+            input_max_fiat_value: "5000".to_string(),
+            input_fiat_currency: "USD".to_string(),
+            input_price_asset: "BTC".to_string(),
+            input_price_value: String::new(),
             input_new_dex_id: String::new(),
             input_new_cex_id: String::new(),
             show_breaker_reset: false,
@@ -820,12 +1134,59 @@ impl TuiState {
             reset_phrase: String::new(),
             reset_focus_index: 0,
             auditor_chain_index: 0,
+            auditor_network: Network::Mainnet,
             auditor_account_index: "0".to_string(),
             auditor_address_index: "0".to_string(),
             auditor_focus: 0,
             auditor_public_key_hex: String::new(),
             auditor_address: String::new(),
+            auditor_segwit_address: String::new(),
+            auditor_expected_input: String::new(),
+            auditor_match_status: String::new(),
             auditor_status: "Seleccione red y pulse Enter para derivar.".to_string(),
+            web3_policy_selected: 0,
+            web3_policy_focus: 0,
+            web3_policy_chain_index: 1,
+            web3_policy_account_index: "0".to_string(),
+            web3_policy_address_index: String::new(),
+            web3_policy_label: "Operativa".to_string(),
+            web3_policy_max_tx: "10".to_string(),
+            web3_policy_max_crypto: String::new(),
+            web3_policy_max_fiat: "5000".to_string(),
+            web3_policy_fiat_currency: "USD".to_string(),
+            web3_policy_require_confirmation: true,
+            web3_policy_destination_input: String::new(),
+            web3_policy_contract_input: String::new(),
+            web3_policy_asset_input: String::new(),
+            web3_policy_asset_limit_input: String::new(),
+            web3_schedule_selected: 0,
+            web3_schedule_focus: 0,
+            web3_schedule_name: String::new(),
+            web3_schedule_asset: "USDT".to_string(),
+            web3_schedule_destination: String::new(),
+            web3_schedule_max_tx: "4".to_string(),
+            web3_schedule_max_asset: String::new(),
+            web3_schedule_max_fiat: String::new(),
+            web3_schedule_currency: "USD".to_string(),
+            web3_schedule_window: "diario".to_string(),
+            web3_schedule_expires_unix: String::new(),
+            web3_price_focus: 0,
+            web3_price_selected: 0,
+            web3_price_asset: "BTC".to_string(),
+            web3_price_fiat: "USD".to_string(),
+            web3_price_value: String::new(),
+            web3_price_source: "manual-local".to_string(),
+            web3_price_max_age_seconds: "86400".to_string(),
+            web3_price_import_path: String::new(),
+            web3_rpc_focus: 0,
+            web3_rpc_chain_index: 1,
+            web3_rpc_address: String::new(),
+            web3_rpc_asset: "native".to_string(),
+            web3_rpc_status: "RPC no consultado.".to_string(),
+            web3_rpc_balance: String::new(),
+            web3_rpc_nonce: String::new(),
+            web3_rpc_fee: String::new(),
+            web3_rpc_tx_status: String::new(),
             sandbox_payload_path: String::new(),
             sandbox_memory_mib: "512".to_string(),
             sandbox_cpu_seconds: "120".to_string(),
@@ -835,6 +1196,7 @@ impl TuiState {
             sandbox_selected_pid: 0,
             sandbox_status: "Seleccione binario y pulse Enter para ejecutar en memfd.".to_string(),
         };
+        state.nodes_chains = state.nodes.chain_names();
         state.refresh_templates_count();
         state.add_log("TUI inicializada.");
         state
@@ -1043,14 +1405,23 @@ impl TuiState {
             .set_rearm_credentials(cajas, master_phrase)?;
 
         self.input_max_tx = supervisor.firewall.rules.max_daily_tx.to_string();
-        self.input_max_volume = supervisor.firewall.rules.max_daily_volume_units.to_string();
+        self.input_max_volume = supervisor
+            .firewall
+            .rules
+            .max_daily_crypto_amount
+            .to_string();
+        self.input_max_fiat_value = supervisor.firewall.rules.max_daily_fiat_value.to_string();
+        self.input_fiat_currency = supervisor.firewall.rules.fiat_currency.clone();
         self.allowed_dex_contracts = supervisor.firewall.rules.allowed_dex_contracts.clone();
         self.allowed_cex_destinations = supervisor.firewall.rules.allowed_cex_destinations.clone();
+        self.account_policies = supervisor.firewall.rules.account_policies.clone();
+        self.price_quotes = supervisor.firewall.rules.price_book.quotes.clone();
         self.cached_gateway_state = supervisor.breaker.state.clone();
         self.cached_tx_count = supervisor.firewall.tx_count_today;
         self.cached_volume_units = supervisor.firewall.volume_today_units;
+        self.cached_fiat_value = supervisor.firewall.fiat_value_today;
 
-        let (tx, rx) = Web3BackgroundWorker::spawn(supervisor);
+        let (tx, rx) = Web3BackgroundWorker::spawn(supervisor, self.nodes.clone());
         self.web3_cmd_tx = Some(tx);
         self.web3_event_rx = Some(rx);
         self.system_notification = "Pasarela Web3 inicializada.".to_string();
@@ -1068,16 +1439,31 @@ impl TuiState {
         };
         self.cached_tx_count = 0;
         self.cached_volume_units = Decimal::ZERO;
+        self.cached_fiat_value = Decimal::ZERO;
         self.system_notification = "Pasarela Web3 detenida.".to_string();
         self.pending_signing_preview = None;
+        self.pending_broadcast_preview = None;
         self.show_breaker_reset = false;
+        self.show_reauth_modal = false;
+        self.pending_action_after_reauth = None;
         self.clear_gateway_secret_fields();
+        self.clear_reauth_secret_fields();
     }
 
     fn clear_gateway_secret_fields(&mut self) {
         zeroize_boxes(&mut self.reset_cajas);
         self.reset_phrase.zeroize();
         self.reset_phrase.clear();
+    }
+
+    fn clear_reauth_secret_fields(&mut self) {
+        zeroize_boxes(&mut self.reauth_cajas);
+        self.reauth_phrase.zeroize();
+        self.reauth_phrase.clear();
+        zeroize_boxes(&mut self.reauth_secondary_cajas);
+        self.reauth_secondary_phrase.zeroize();
+        self.reauth_secondary_phrase.clear();
+        self.reauth_focus = 0;
     }
 
     fn insert_virtual_char(&mut self) {
@@ -1139,6 +1525,9 @@ impl Drop for TuiState {
         self.system_notification.zeroize();
         self.auditor_public_key_hex.zeroize();
         self.auditor_address.zeroize();
+        self.auditor_segwit_address.zeroize();
+        self.auditor_expected_input.zeroize();
+        self.auditor_match_status.zeroize();
         self.auditor_status.zeroize();
         self.sandbox_payload_path.zeroize();
         self.sandbox_status.zeroize();
@@ -1379,27 +1768,174 @@ fn decrement_numeric_string(value: &mut String) {
     *value = current.saturating_sub(1).to_string();
 }
 
-fn public_key_address_label(chain: &ChainType, public_key: &[u8]) -> String {
-    match chain {
-        ChainType::Ethereum if public_key.len() == 64 => {
-            let hash = Keccak256::digest(public_key);
-            format!("0x{}", hex::encode(&hash[12..]))
-        }
-        ChainType::Solana if public_key.len() == 32 => bs58::encode(public_key).into_string(),
-        ChainType::Bitcoin => format!(
-            "btc-pubkey:{}",
-            truncate_chars(&hex::encode(public_key), 72)
-        ),
-        ChainType::Ethereum => format!(
-            "eth-pubkey:{}",
-            truncate_chars(&hex::encode(public_key), 72)
-        ),
-        ChainType::Solana => format!(
-            "sol-pubkey:{}",
-            truncate_chars(&hex::encode(public_key), 72)
-        ),
-        ChainType::Monero => "Monero no soportado en auditor TUI.".to_string(),
+fn public_key_address_label(chain: &ChainType, public_key: &[u8], network: Network) -> String {
+    match address::public_address_for_network(chain, public_key, network) {
+        Ok(address) => address,
+        Err(_) => match chain {
+            ChainType::Bitcoin => format!(
+                "btc-pubkey:{}",
+                truncate_chars(&hex::encode(public_key), 72)
+            ),
+            ChainType::Ethereum => format!(
+                "eth-pubkey:{}",
+                truncate_chars(&hex::encode(public_key), 72)
+            ),
+            ChainType::Solana => format!(
+                "sol-pubkey:{}",
+                truncate_chars(&hex::encode(public_key), 72)
+            ),
+            ChainType::Monero => "Monero no soportado en auditor TUI.".to_string(),
+            ChainType::Zcash => "Zcash no soportado en auditor TUI.".to_string(),
+            ChainType::Starknet => "Starknet no soportado en auditor TUI.".to_string(),
+        },
     }
+}
+
+fn chain_support_status(chain: &ChainType) -> &'static str {
+    match chain {
+        ChainType::Bitcoin => "firma soportada parcial: parser BTC raw + firma secp256k1",
+        ChainType::Ethereum => "firma soportada parcial: EVM basico + ERC-20 transfer",
+        ChainType::Solana => "firma soportada parcial: transferencia nativa",
+        ChainType::Monero => "solo auditoria/no soportada: requiere adaptador Monero separado",
+        ChainType::Zcash => "solo auditoria/no soportada: requiere adaptador Zcash separado",
+        ChainType::Starknet => "solo auditoria/no soportada: requiere adaptador Starknet separado",
+    }
+}
+
+fn derivation_path_label(chain: &ChainType, account: u32, index: u32) -> String {
+    address::derivation_path(chain, account, index)
+}
+
+fn selected_auditor_indexes(state: &TuiState) -> (u32, u32) {
+    let account_index = state
+        .auditor_account_index
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    let address_index = state
+        .auditor_address_index
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    (account_index, address_index)
+}
+
+fn wallet_qr_payload(state: &TuiState) -> Option<String> {
+    if state.auditor_address.is_empty() {
+        return None;
+    }
+    let chain = selected_auditor_chain(state);
+    let (account_index, address_index) = selected_auditor_indexes(state);
+    let derivation_path = derivation_path_label(&chain, account_index, address_index);
+    Some(
+        serde_json::json!({
+            "type": "livencrypt-wallet",
+            "v": 1,
+            "chain": format!("{:?}", chain),
+            "account": account_index,
+            "index": address_index,
+            "path": derivation_path,
+            "address": state.auditor_address,
+        })
+        .to_string(),
+    )
+}
+
+fn wallet_clipboard_payload(state: &TuiState) -> Option<String> {
+    if state.auditor_address.is_empty() {
+        return None;
+    }
+    let chain = selected_auditor_chain(state);
+    let (account_index, address_index) = selected_auditor_indexes(state);
+    let derivation_path = derivation_path_label(&chain, account_index, address_index);
+    Some(
+        serde_json::json!({
+            "type": "livencrypt-wallet-link",
+            "version": 1,
+            "chain": format!("{:?}", chain),
+            "account": account_index,
+            "address_index": address_index,
+            "derivation_path": derivation_path,
+            "address": state.auditor_address,
+            "public_key_hex": state.auditor_public_key_hex,
+            "scope": "public-address-only",
+            "warning": "No contiene clave privada ni frase secreta",
+        })
+        .to_string(),
+    )
+}
+
+fn copy_wallet_link_payload(state: &mut TuiState) {
+    if !require_boot_shield_confirmation_for_auditor(state, PendingAction::AuditorCopy) {
+        return;
+    }
+    let Some(payload) = wallet_clipboard_payload(state) else {
+        state.auditor_status = "Primero derive una direccion para copiar el vinculo.".to_string();
+        return;
+    };
+    match write_system_clipboard(&payload) {
+        Ok(()) => {
+            state.auditor_status =
+                "Vinculo publico de wallet copiado para extension/aplicacion.".to_string();
+        }
+        Err(error) => {
+            state.auditor_status = format!(
+                "Vinculo generado, pero no se pudo copiar al portapapeles: {}",
+                error
+            );
+        }
+    }
+}
+
+fn account_policy_label(
+    policies: &[AccountPolicy],
+    chain: &ChainType,
+    account: u32,
+    index: u32,
+    global_tx: &str,
+    global_fiat: &str,
+    global_currency: &str,
+) -> Vec<Line<'static>> {
+    if let Some(policy) = policies
+        .iter()
+        .find(|policy| policy.applies_to(chain, account, index))
+    {
+        return vec![
+            Line::from(format!("Politica: {}", policy.label)),
+            Line::from(format!("Max TX ventana: {}", policy.max_tx_per_window)),
+            Line::from(format!(
+                "Max fiat: {} {}",
+                policy
+                    .max_fiat_value
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "sin limite especifico".to_string()),
+                policy.fiat_currency
+            )),
+            Line::from(format!(
+                "Destinos permitidos: {} | Contratos: {}",
+                policy.allowed_destinations.len(),
+                policy.allowed_contracts.len()
+            )),
+            Line::from(format!(
+                "Reglas programadas: {}",
+                policy
+                    .scheduled_rules
+                    .iter()
+                    .filter(|rule| rule.enabled)
+                    .count()
+            )),
+        ];
+    }
+
+    vec![
+        Line::from("Politica: global"),
+        Line::from(format!("Max TX diario: {}", global_tx)),
+        Line::from(format!(
+            "Max fiat diario: {} {}",
+            global_fiat, global_currency
+        )),
+        Line::from("Sin reglas especificas por cuenta/direccion."),
+    ]
 }
 
 fn shuffled_keyboard() -> Vec<char> {
@@ -1543,24 +2079,65 @@ fn process_background_web3_events(state: &mut TuiState) {
             Ok(Web3WorkerEvent::MetricsUpdated {
                 tx_count,
                 volume_units,
+                fiat_value,
+                fiat_currency,
             }) => {
                 state.cached_tx_count = tx_count;
                 state.cached_volume_units = volume_units;
+                state.cached_fiat_value = fiat_value;
+                state.input_fiat_currency = fiat_currency;
             }
             Ok(Web3WorkerEvent::SyncRules(rules)) => {
                 state.allowed_dex_contracts = rules.allowed_dex_contracts;
                 state.allowed_cex_destinations = rules.allowed_cex_destinations;
+                state.account_policies = rules.account_policies;
+                state.price_quotes = rules.price_book.quotes;
                 if state.gateway_focused_field != 0 {
                     state.input_max_tx = rules.max_daily_tx.to_string();
                 }
                 if state.gateway_focused_field != 1 {
-                    state.input_max_volume = rules.max_daily_volume_units.to_string();
+                    state.input_max_volume = rules.max_daily_crypto_amount.to_string();
+                }
+                if state.gateway_focused_field != 2 {
+                    state.input_max_fiat_value = rules.max_daily_fiat_value.to_string();
+                }
+                if state.gateway_focused_field != 3 {
+                    state.input_fiat_currency = rules.fiat_currency;
                 }
             }
+            Ok(Web3WorkerEvent::AccountPoliciesUpdated(policies)) => {
+                state.account_policies = policies;
+                if state.web3_policy_selected >= state.account_policies.len() {
+                    state.web3_policy_selected = state.account_policies.len().saturating_sub(1);
+                }
+            }
+            Ok(Web3WorkerEvent::PriceBookUpdated(price_book)) => {
+                state.price_quotes = price_book.quotes;
+            }
+            Ok(Web3WorkerEvent::RpcInspectorResult { label, result }) => match result {
+                Ok(value) => {
+                    match label.as_str() {
+                        "balance" => state.web3_rpc_balance = value.clone(),
+                        "nonce" => state.web3_rpc_nonce = value.clone(),
+                        "fee" => state.web3_rpc_fee = value.clone(),
+                        "tx_status" => state.web3_rpc_tx_status = value.clone(),
+                        _ => {}
+                    }
+                    state.web3_rpc_status = format!("{} OK: {}", label, value);
+                }
+                Err(error) => {
+                    state.web3_rpc_status = format!("{}: {}", label, error);
+                }
+            },
             Ok(Web3WorkerEvent::SigningRequest(preview)) => {
                 state.pending_signing_preview = Some(preview);
                 state.screen = Screen::WalletGateway;
                 state.status = "Firma Web3 pendiente de autorizacion local.".to_string();
+            }
+            Ok(Web3WorkerEvent::BroadcastRequest(preview)) => {
+                state.pending_broadcast_preview = Some(preview);
+                state.screen = Screen::WalletGateway;
+                state.status = "Broadcast Web3 pendiente de autorizacion local.".to_string();
             }
             Ok(Web3WorkerEvent::PublicKeyDerived {
                 chain,
@@ -1570,7 +2147,16 @@ fn process_background_web3_events(state: &mut TuiState) {
             }) => match result {
                 Ok(public_key) => {
                     state.auditor_public_key_hex = hex::encode(&public_key);
-                    state.auditor_address = public_key_address_label(&chain, &public_key);
+                    state.auditor_address =
+                        public_key_address_label(&chain, &public_key, state.auditor_network);
+                    state.auditor_segwit_address = match chain {
+                        ChainType::Bitcoin => {
+                            address::bitcoin_p2wpkh_address(&public_key, state.auditor_network)
+                                .unwrap_or_else(|error| format!("segwit no disponible: {}", error))
+                        }
+                        _ => String::new(),
+                    };
+                    recompute_auditor_match(state);
                     state.auditor_status = format!(
                         "Derivacion OK: {:?} cuenta {} indice {}.",
                         chain, account_index, address_index
@@ -1585,9 +2171,30 @@ fn process_background_web3_events(state: &mut TuiState) {
                     state.auditor_public_key_hex.clear();
                     state.auditor_address.zeroize();
                     state.auditor_address.clear();
+                    state.auditor_segwit_address.clear();
+                    state.auditor_match_status.clear();
                     state.auditor_status = format!("Error derivando clave publica: {}", error);
                 }
             },
+            Ok(Web3WorkerEvent::DerivationVerified {
+                chain,
+                account_index,
+                address_index,
+                matches,
+                address,
+            }) => {
+                if matches {
+                    state.auditor_status = format!(
+                        "Verificacion OK ✔: {:?} cuenta {} indice {} reproducible ({}).",
+                        chain, account_index, address_index, address
+                    );
+                } else {
+                    state.auditor_status = format!(
+                        "Verificacion FALLIDA ✘: {:?} cuenta {} indice {} NO reproducible.",
+                        chain, account_index, address_index
+                    );
+                }
+            }
             Ok(Web3WorkerEvent::Notification(message)) => {
                 state.system_notification = message;
             }
@@ -1615,8 +2222,26 @@ fn close_forensic_report(state: &mut TuiState) {
 }
 
 fn handle_key(state: &mut TuiState, key: KeyEvent) {
+    // Pegado explícito Ctrl+V en cualquier campo de datos (validado por tipo).
+    // El editor de texto (TextCipher) mantiene su propio manejo de Ctrl+V.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        && state.screen != Screen::TextCipher
+        && !state.is_processing
+    {
+        paste_clipboard_into_focused(state);
+        return;
+    }
+    if state.show_reauth_modal {
+        handle_reauth_modal_key(state, key);
+        return;
+    }
     if state.pending_signing_preview.is_some() {
         handle_signing_authorization_key(state, key);
+        return;
+    }
+    if state.pending_broadcast_preview.is_some() {
+        handle_broadcast_authorization_key(state, key);
         return;
     }
     if state.show_file_browser {
@@ -1647,32 +2272,228 @@ fn handle_key(state: &mut TuiState, key: KeyEvent) {
         Screen::TemplateEditor => handle_template_editor_key(state, key),
         Screen::Settings => handle_settings_key(state, key),
         Screen::SystemMonitor => handle_system_monitor_key(state, key),
-        Screen::AuditMonitor => handle_back_to_dashboard_key(state, key),
+        Screen::AuditMonitor => handle_audit_monitor_key(state, key),
         Screen::FirmwareStaging => handle_firmware_staging_key(state, key),
         Screen::SandboxManager => handle_sandbox_manager_key(state, key),
         Screen::RecoveryMode => handle_recovery_key(state, key),
         Screen::InstallProfile => handle_back_to_dashboard_key(state, key),
         Screen::WalletGateway => handle_wallet_gateway_key(state, key),
-<<<<<<< HEAD
         Screen::WalletAuditor => handle_wallet_auditor_key(state, key),
-=======
         Screen::NodesManager => handle_nodes_manager_key(state, key),
->>>>>>> origin/feature/dev-alexander
+        Screen::Web3AccountPolicies => handle_web3_account_policies_key(state, key),
+        Screen::Web3ScheduledRules => handle_web3_scheduled_rules_key(state, key),
+        Screen::Web3PriceOracle => handle_web3_price_oracle_key(state, key),
+        Screen::Web3RpcInspector => handle_web3_rpc_inspector_key(state, key),
+        Screen::Web3AccountEditor => handle_web3_account_policies_key(state, key),
+    }
+}
+
+fn gateway_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.gateway_focused_field {
+        0 => Some(&mut state.input_max_tx),
+        1 => Some(&mut state.input_max_volume),
+        2 => Some(&mut state.input_max_fiat_value),
+        3 => Some(&mut state.input_fiat_currency),
+        4 => Some(&mut state.input_price_asset),
+        5 => Some(&mut state.input_price_value),
+        6 => Some(&mut state.input_new_dex_id),
+        7 => Some(&mut state.input_new_cex_id),
+        _ => None,
+    }
+}
+
+fn auditor_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.auditor_focus {
+        1 => Some(&mut state.auditor_account_index),
+        2 => Some(&mut state.auditor_address_index),
+        3 => Some(&mut state.auditor_expected_input),
+        _ => None,
+    }
+}
+
+fn reauth_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.reauth_focus {
+        0..=4 => Some(&mut state.reauth_cajas[state.reauth_focus]),
+        5 => Some(&mut state.reauth_phrase),
+        6..=10 => Some(&mut state.reauth_secondary_cajas[state.reauth_focus - 6]),
+        _ => Some(&mut state.reauth_secondary_phrase),
+    }
+}
+
+/// Campo de entrada enfocado en la pantalla/modal activos (destino del pegado de portapapeles).
+fn focused_paste_target(state: &mut TuiState) -> Option<&mut String> {
+    if state.show_reauth_modal {
+        return reauth_field_mut(state);
+    }
+    if state.show_breaker_reset {
+        return if state.reset_focus_index < 5 {
+            Some(&mut state.reset_cajas[state.reset_focus_index])
+        } else {
+            Some(&mut state.reset_phrase)
+        };
+    }
+    match state.screen {
+        Screen::WalletGateway => gateway_field_mut(state),
+        Screen::WalletAuditor => auditor_field_mut(state),
+        Screen::Web3AccountPolicies | Screen::Web3AccountEditor => policy_field_mut(state),
+        Screen::Web3ScheduledRules => schedule_field_mut(state),
+        Screen::Web3PriceOracle => price_field_mut(state),
+        Screen::Web3RpcInspector => rpc_field_mut(state),
+        Screen::Settings => Some(active_settings_field_mut(state)),
+        Screen::FileCipher => Some(active_file_field_mut(state)),
+        _ => None,
+    }
+}
+
+/// Tipo de dato aceptado por un campo de entrada.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FieldKind {
+    /// Entero sin signo (índices, contadores): solo dígitos.
+    Integer,
+    /// Entero con signo (cajas -999..999): dígitos y un '-' inicial.
+    SignedInteger,
+    /// Decimal (USD/BTC/ETH y montos): dígitos y un único separador decimal.
+    Decimal,
+    /// Texto libre (direcciones, IDs, etiquetas, rutas, frases): texto+números+especiales.
+    Text,
+}
+
+/// Tipo del campo enfocado en la pantalla/modal activos.
+fn focused_field_kind(state: &TuiState) -> FieldKind {
+    if state.show_reauth_modal {
+        return match state.reauth_focus {
+            0..=4 | 6..=10 => FieldKind::SignedInteger,
+            _ => FieldKind::Text,
+        };
+    }
+    if state.show_breaker_reset {
+        return if state.reset_focus_index < 5 {
+            FieldKind::SignedInteger
+        } else {
+            FieldKind::Text
+        };
+    }
+    match state.screen {
+        Screen::WalletGateway => match state.gateway_focused_field {
+            0 => FieldKind::Integer,
+            1 | 2 | 5 => FieldKind::Decimal,
+            _ => FieldKind::Text,
+        },
+        Screen::WalletAuditor => match state.auditor_focus {
+            1 | 2 => FieldKind::Integer,
+            _ => FieldKind::Text,
+        },
+        Screen::Web3AccountPolicies | Screen::Web3AccountEditor => match state.web3_policy_focus {
+            1 | 2 | 4 => FieldKind::Integer,
+            5 | 6 | 12 => FieldKind::Decimal,
+            _ => FieldKind::Text,
+        },
+        Screen::Web3ScheduledRules => match state.web3_schedule_focus {
+            3 | 8 => FieldKind::Integer,
+            4 | 5 => FieldKind::Decimal,
+            _ => FieldKind::Text,
+        },
+        Screen::Web3PriceOracle => match state.web3_price_focus {
+            2 => FieldKind::Decimal,
+            3 => FieldKind::Integer,
+            _ => FieldKind::Text,
+        },
+        Screen::Settings => match state.settings_focus {
+            0..=4 | 7..=11 | 13..=17 => FieldKind::SignedInteger,
+            _ => FieldKind::Text,
+        },
+        _ => FieldKind::Text,
+    }
+}
+
+/// Inserta `input` en `field` aceptando solo los caracteres válidos para el tipo de campo.
+fn sanitize_into_field(kind: FieldKind, field: &mut String, input: &str, max_len: usize) {
+    for raw in input.chars() {
+        if field.chars().count() >= max_len {
+            break;
+        }
+        match kind {
+            FieldKind::Integer => {
+                if raw.is_ascii_digit() {
+                    field.push(raw);
+                }
+            }
+            FieldKind::SignedInteger => {
+                if raw.is_ascii_digit() || (raw == '-' && field.is_empty()) {
+                    field.push(raw);
+                }
+            }
+            FieldKind::Decimal => {
+                let character = if raw == ',' { '.' } else { raw };
+                if character.is_ascii_digit() {
+                    field.push(character);
+                } else if character == '.' && !field.contains('.') {
+                    field.push('.');
+                }
+            }
+            FieldKind::Text => {
+                if !raw.is_control() {
+                    field.push(raw);
+                }
+            }
+        }
+    }
+}
+
+/// Inserta texto (de teclado o portapapeles) en el campo enfocado, validado por su tipo.
+fn insert_text_into_focused(state: &mut TuiState, text: &str) {
+    let kind = focused_field_kind(state);
+    let recompute = state.screen == Screen::WalletAuditor && state.auditor_focus == 3;
+    if let Some(field) = focused_paste_target(state) {
+        sanitize_into_field(kind, field, text, 512);
+    }
+    if recompute {
+        recompute_auditor_match(state);
+    }
+}
+
+/// Lee el portapapeles del sistema y lo pega (validado por tipo) en el campo enfocado.
+fn paste_clipboard_into_focused(state: &mut TuiState) {
+    match read_system_clipboard() {
+        Ok(text) => {
+            if focused_paste_target(state).is_none() {
+                state.system_notification =
+                    "No hay campo de entrada enfocado para pegar.".to_string();
+                return;
+            }
+            insert_text_into_focused(state, &text);
+            state.system_notification = "Datos pegados desde el portapapeles.".to_string();
+        }
+        Err(error) => {
+            state.system_notification = format!("No se pudo leer el portapapeles: {}", error);
+        }
     }
 }
 
 fn handle_paste_event(state: &mut TuiState, text: String) {
-    if state.screen != Screen::TextCipher
-        || state.show_file_browser
-        || state.show_matrix_config
-        || state.is_processing
-    {
+    if state.is_processing {
         return;
     }
-    paste_text_into_text_cipher(state, &text);
+    // El editor de texto mantiene su pegado multilinea propio.
+    if state.screen == Screen::TextCipher
+        && !state.show_file_browser
+        && !state.show_matrix_config
+        && !state.show_reauth_modal
+        && !state.show_breaker_reset
+    {
+        paste_text_into_text_cipher(state, &text);
+        return;
+    }
+    if state.show_file_browser || state.show_matrix_config {
+        return;
+    }
+    insert_text_into_focused(state, &text);
 }
 
 fn handle_mouse_event(state: &mut TuiState, mouse: MouseEvent) {
+    if state.show_reauth_modal {
+        return;
+    }
     if state.pending_signing_preview.is_some() {
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             let area = terminal_area();
@@ -1685,10 +2506,36 @@ fn handle_mouse_event(state: &mut TuiState, mouse: MouseEvent) {
         }
         return;
     }
+    if state.pending_broadcast_preview.is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            let area = terminal_area();
+            let inner = centered_area(area, 94, 88);
+            let popup = centered_area(inner, 78, 56);
+            if point_in_rect(mouse.column, mouse.row, popup) {
+                let approve = mouse.column < popup.x + popup.width / 2;
+                submit_broadcast_authorization(state, approve);
+            }
+        }
+        return;
+    }
     match mouse.kind {
         MouseEventKind::ScrollUp => handle_mouse_scroll(state, true),
         MouseEventKind::ScrollDown => handle_mouse_scroll(state, false),
-        MouseEventKind::Down(MouseButton::Left) => handle_mouse(state, mouse),
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Detección de doble clic (≤400 ms y misma celda ±1): el primer clic enfoca el
+            // campo; el segundo pega del portapapeles (validado por tipo) en ese campo.
+            let now = current_unix_millis();
+            let is_double = now.saturating_sub(state.last_click_millis) <= 400
+                && state.last_click_col.abs_diff(mouse.column) <= 1
+                && state.last_click_row.abs_diff(mouse.row) <= 1;
+            state.last_click_millis = now;
+            state.last_click_col = mouse.column;
+            state.last_click_row = mouse.row;
+            handle_mouse(state, mouse);
+            if is_double && !state.is_processing && focused_paste_target(state).is_some() {
+                paste_clipboard_into_focused(state);
+            }
+        }
         _ => {}
     }
 }
@@ -1801,7 +2648,12 @@ fn handle_mouse(state: &mut TuiState, mouse: MouseEvent) {
         | Screen::FirmwareStaging
         | Screen::RecoveryMode
         | Screen::InstallProfile
-        | Screen::NodesManager => {
+        | Screen::NodesManager
+        | Screen::Web3AccountPolicies
+        | Screen::Web3ScheduledRules
+        | Screen::Web3PriceOracle
+        | Screen::Web3RpcInspector
+        | Screen::Web3AccountEditor => {
             if mouse.row <= inner.y + 1 {
                 state.screen = Screen::Dashboard;
             }
@@ -1906,7 +2758,10 @@ fn handle_dashboard_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
         5 => state.screen = Screen::TextCipher,
         6 => state.screen = Screen::FileCipher,
         7 => state.screen = Screen::TemplateEditor,
-        8 => state.screen = Screen::Settings,
+        8 => {
+            state.settings_destructive_auditor_reauth = load_destructive_reauth_flag();
+            state.screen = Screen::Settings;
+        }
         9 => {
             state.refresh_integrity();
             state.screen = Screen::SystemMonitor;
@@ -2339,6 +3194,7 @@ fn handle_dashboard_key(state: &mut TuiState, key: KeyEvent) {
         }
         KeyCode::Char('c') => {
             state.settings_focus = 0;
+            state.settings_destructive_auditor_reauth = load_destructive_reauth_flag();
             state.screen = Screen::Settings;
         }
         KeyCode::Char('m') => {
@@ -2371,8 +3227,31 @@ fn handle_back_to_dashboard_key(state: &mut TuiState, key: KeyEvent) {
     }
 }
 
-<<<<<<< HEAD
+fn handle_audit_monitor_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
+        KeyCode::Char('v') | KeyCode::Char('V') => verify_web3_audit_chain_ui(state),
+        _ => {}
+    }
+}
+
+/// C.4: verifica la integridad + firma del log de auditoria Web3 y muestra el resultado.
+fn verify_web3_audit_chain_ui(state: &mut TuiState) {
+    match livencrypt_lib::crypto::blockchain::web3_audit::verify_local_audit_chain() {
+        Ok(()) => {
+            state.system_notification =
+                "Cadena de auditoria Web3 integra y firmada correctamente.".to_string();
+        }
+        Err(error) => {
+            state.system_notification = format!("AUDITORIA WEB3: {}", error);
+        }
+    }
+}
+
 fn submit_wallet_auditor_derivation(state: &mut TuiState) {
+    if !require_boot_shield_confirmation_for_auditor(state, PendingAction::AuditorDerive) {
+        return;
+    }
     let Ok(account_index) = parse_auditor_index(&state.auditor_account_index) else {
         state.auditor_status = "Cuenta invalida: use un entero sin signo.".to_string();
         return;
@@ -2386,6 +3265,7 @@ fn submit_wallet_auditor_derivation(state: &mut TuiState) {
     if let Some(tx) = &state.web3_cmd_tx {
         let result = tx.send(Web3WorkerCmd::DerivePublicKey {
             chain: chain.clone(),
+            network: state.auditor_network,
             account_index,
             address_index,
         });
@@ -2401,6 +3281,306 @@ fn submit_wallet_auditor_derivation(state: &mut TuiState) {
         state.auditor_status =
             "Web3 no inicializado: desbloquee Boot Shield o configure el vault.".to_string();
     }
+}
+
+fn current_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn current_unix_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+const DESTRUCTIVE_REAUTH_KEY: &str = "auditor_destructive_reauth";
+
+/// Lee en vivo del vault si la re-confirmacion del auditor debe usar el verificador
+/// DESTRUCTIVO (boot_shield_unlock: un fallo cuenta intento y puede destruir el vault).
+fn load_destructive_reauth_flag() -> bool {
+    security::vault::read_unlocked_settings()
+        .ok()
+        .flatten()
+        .and_then(|map| map.get(DESTRUCTIVE_REAUTH_KEY).cloned())
+        .map(|value| value == "true")
+        .unwrap_or(false)
+}
+
+fn persist_destructive_reauth_flag(enabled: bool) -> Result<(), String> {
+    let mut entries = std::collections::HashMap::new();
+    entries.insert(
+        DESTRUCTIVE_REAUTH_KEY.to_string(),
+        if enabled { "true" } else { "false" }.to_string(),
+    );
+    security::vault::update_unlocked_settings(entries).map(|_| ())
+}
+
+fn toggle_destructive_auditor_reauth(state: &mut TuiState) {
+    let new_value = !state.settings_destructive_auditor_reauth;
+    match persist_destructive_reauth_flag(new_value) {
+        Ok(()) => {
+            state.settings_destructive_auditor_reauth = new_value;
+            state.status = if new_value {
+                "Re-auth destructiva auditor: ON. Un fallo DESTRUYE el vault (tenga backup externo)."
+                    .to_string()
+            } else {
+                "Re-auth destructiva auditor: OFF (verificacion read-only segura).".to_string()
+            };
+        }
+        Err(error) => {
+            state.status = format!("No se pudo guardar el ajuste (vault bloqueado?): {}", error);
+        }
+    }
+}
+
+/// Gate C.4: exige re-confirmacion Boot Shield reciente antes de derivar/verificar/exportar
+/// en el auditor. Devuelve true si la sesion re-valido dentro de la ventana; si no, arma el
+/// modal de re-autenticacion y devuelve false para abortar la accion en curso.
+fn require_boot_shield_confirmation_for_auditor(
+    state: &mut TuiState,
+    action: PendingAction,
+) -> bool {
+    const AUDITOR_REAUTH_WINDOW_SECS: u64 = 120;
+    let now = current_unix_secs();
+    if state.last_identity_confirmation_unix != 0
+        && now.saturating_sub(state.last_identity_confirmation_unix) <= AUDITOR_REAUTH_WINDOW_SECS
+    {
+        return true;
+    }
+    state.pending_action_after_reauth = Some(action);
+    state.reauth_focus = 0;
+    zeroize_boxes(&mut state.reauth_cajas);
+    state.reauth_phrase.zeroize();
+    state.reauth_phrase.clear();
+    state.show_reauth_modal = true;
+    state.auditor_status = "Re-confirmacion Boot Shield requerida para el auditor.".to_string();
+    false
+}
+
+/// Número de campos del modal de re-auth: 6 (primaria) o 12 (con doble credencial).
+fn reauth_field_count(state: &TuiState) -> usize {
+    if state.unlock_requires_secondary() {
+        12
+    } else {
+        6
+    }
+}
+
+fn handle_reauth_modal_key(state: &mut TuiState, key: KeyEvent) {
+    let count = reauth_field_count(state);
+    match key.code {
+        KeyCode::Esc => cancel_reauth(state),
+        KeyCode::Tab => state.reauth_focus = (state.reauth_focus + 1) % count,
+        KeyCode::BackTab => {
+            state.reauth_focus = if state.reauth_focus == 0 {
+                count - 1
+            } else {
+                state.reauth_focus - 1
+            };
+        }
+        KeyCode::Backspace => match state.reauth_focus {
+            0..=4 => {
+                state.reauth_cajas[state.reauth_focus].pop();
+            }
+            5 => {
+                state.reauth_phrase.pop();
+            }
+            6..=10 => {
+                state.reauth_secondary_cajas[state.reauth_focus - 6].pop();
+            }
+            _ => {
+                state.reauth_secondary_phrase.pop();
+            }
+        },
+        KeyCode::Enter => submit_reauth(state),
+        KeyCode::Char(value) => match state.reauth_focus {
+            0..=4 => {
+                let target = &mut state.reauth_cajas[state.reauth_focus];
+                if target.len() < 32 {
+                    target.push(value);
+                }
+            }
+            5 => {
+                if state.reauth_phrase.len() < 120 {
+                    state.reauth_phrase.push(value);
+                }
+            }
+            6..=10 => {
+                let target = &mut state.reauth_secondary_cajas[state.reauth_focus - 6];
+                if target.len() < 32 {
+                    target.push(value);
+                }
+            }
+            _ => {
+                if state.reauth_secondary_phrase.len() < 120 {
+                    state.reauth_secondary_phrase.push(value);
+                }
+            }
+        },
+        _ => {}
+    }
+}
+
+fn cancel_reauth(state: &mut TuiState) {
+    state.clear_reauth_secret_fields();
+    state.show_reauth_modal = false;
+    state.pending_action_after_reauth = None;
+    state.auditor_status = "Re-confirmacion cancelada.".to_string();
+}
+
+fn submit_reauth(state: &mut TuiState) {
+    let Ok(cajas) = parse_boxes(&state.reauth_cajas) else {
+        state.auditor_status = "Cajas invalidas: use enteros con signo.".to_string();
+        return;
+    };
+    if state.reauth_phrase.trim().is_empty() {
+        state.auditor_status = "Frase maestra requerida.".to_string();
+        return;
+    }
+    let requires_secondary = state.unlock_requires_secondary();
+    let (secondary_cajas, secondary_frase): (Option<[i64; 5]>, Option<String>) = if requires_secondary
+    {
+        let Ok(sc) = parse_boxes(&state.reauth_secondary_cajas) else {
+            state.auditor_status = "Cajas secundarias invalidas: use enteros con signo.".to_string();
+            return;
+        };
+        if state.reauth_secondary_phrase.trim().is_empty() {
+            state.auditor_status = "Frase secundaria requerida.".to_string();
+            return;
+        }
+        (Some(sc), Some(state.reauth_secondary_phrase.clone()))
+    } else {
+        (None, None)
+    };
+    let destructive = load_destructive_reauth_flag();
+    let verified = if destructive {
+        // Verificador DESTRUCTIVO opcional: un fallo incrementa el contador de intentos
+        // y puede destruir el vault / disparar la clave de coaccion. Solo si el usuario lo
+        // activo a proposito en Configuraciones (debe tener backup externo).
+        security::vault::boot_shield_unlock(
+            cajas,
+            state.reauth_phrase.clone(),
+            secondary_cajas,
+            secondary_frase.clone(),
+        )
+        .is_ok()
+    } else {
+        security::vault::verify_credentials_readonly_dual(
+            cajas,
+            &state.reauth_phrase,
+            secondary_cajas,
+            secondary_frase.as_deref(),
+        )
+    };
+    state.clear_reauth_secret_fields();
+    state.show_reauth_modal = false;
+    if !verified {
+        state.pending_action_after_reauth = None;
+        state.auditor_status = if destructive {
+            "Re-confirmacion fallida: credenciales invalidas (modo destructivo activo).".to_string()
+        } else {
+            "Re-confirmacion fallida: credenciales invalidas.".to_string()
+        };
+        return;
+    }
+    state.last_identity_confirmation_unix = current_unix_secs();
+    let action = state.pending_action_after_reauth.take();
+    state.auditor_status = "Identidad re-confirmada; ejecutando accion del auditor.".to_string();
+    match action {
+        Some(PendingAction::AuditorDerive) => submit_wallet_auditor_derivation(state),
+        Some(PendingAction::AuditorVerify) => submit_wallet_auditor_verification(state),
+        Some(PendingAction::AuditorCopy) => copy_wallet_link_payload(state),
+        None => {}
+    }
+}
+
+fn submit_wallet_auditor_verification(state: &mut TuiState) {
+    if !require_boot_shield_confirmation_for_auditor(state, PendingAction::AuditorVerify) {
+        return;
+    }
+    let Ok(account_index) = parse_auditor_index(&state.auditor_account_index) else {
+        state.auditor_status = "Cuenta invalida: use un entero sin signo.".to_string();
+        return;
+    };
+    let Ok(address_index) = parse_auditor_index(&state.auditor_address_index) else {
+        state.auditor_status = "Indice invalido: use un entero sin signo.".to_string();
+        return;
+    };
+    let chain = selected_auditor_chain(state);
+
+    if let Some(tx) = &state.web3_cmd_tx {
+        let result = tx.send(Web3WorkerCmd::VerifyDerivation {
+            chain: chain.clone(),
+            network: state.auditor_network,
+            account_index,
+            address_index,
+        });
+        if result.is_ok() {
+            state.auditor_status = format!(
+                "Solicitada verificacion (doble derivacion) {:?} cuenta {} indice {}.",
+                chain, account_index, address_index
+            );
+        } else {
+            state.auditor_status = "Web3 no acepta solicitudes en este momento.".to_string();
+        }
+    } else {
+        state.auditor_status =
+            "Web3 no inicializado: desbloquee Boot Shield o configure el vault.".to_string();
+    }
+}
+
+fn toggle_auditor_network(state: &mut TuiState) {
+    state.auditor_network = match state.auditor_network {
+        Network::Mainnet => Network::Testnet,
+        Network::Testnet => Network::Mainnet,
+    };
+    // La red cambia la derivacion/direccion: invalidar la vista actual.
+    state.auditor_address.clear();
+    state.auditor_segwit_address.clear();
+    state.auditor_match_status.clear();
+    state.auditor_status = format!(
+        "Red: {:?}. Pulse Enter para derivar de nuevo.",
+        state.auditor_network
+    );
+}
+
+/// C.3: valida el checksum de la direccion introducida y la compara con la derivada.
+fn recompute_auditor_match(state: &mut TuiState) {
+    let expected = state.auditor_expected_input.trim().to_string();
+    if expected.is_empty() {
+        state.auditor_match_status.clear();
+        return;
+    }
+    if state.auditor_address.is_empty() {
+        state.auditor_match_status = "Primero derive una direccion.".to_string();
+        return;
+    }
+    let chain = selected_auditor_chain(state);
+    let checksum_ok = match chain {
+        ChainType::Ethereum => address::validate_ethereum_address_checksum(&expected),
+        ChainType::Bitcoin => address::validate_bitcoin_address_checksum(&expected).is_ok(),
+        ChainType::Solana => address::validate_solana_address(&expected).is_ok(),
+        _ => true,
+    };
+    if !checksum_ok {
+        state.auditor_match_status =
+            "X Checksum de la direccion introducida invalido.".to_string();
+        return;
+    }
+    let matches = if matches!(chain, ChainType::Ethereum) {
+        state.auditor_address.eq_ignore_ascii_case(&expected)
+    } else {
+        state.auditor_address == expected || state.auditor_segwit_address == expected
+    };
+    state.auditor_match_status = if matches {
+        "OK Coincide con la direccion derivada.".to_string()
+    } else {
+        "X NO coincide con la direccion derivada.".to_string()
+    };
 }
 
 fn cycle_wallet_auditor_chain(state: &mut TuiState, forward: bool) {
@@ -2424,10 +3604,10 @@ fn edit_wallet_auditor_number(target: &mut String, value: char) {
 fn handle_wallet_auditor_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
-        KeyCode::Tab => state.auditor_focus = (state.auditor_focus + 1) % 3,
+        KeyCode::Tab => state.auditor_focus = (state.auditor_focus + 1) % 4,
         KeyCode::BackTab => {
             state.auditor_focus = if state.auditor_focus == 0 {
-                2
+                3
             } else {
                 state.auditor_focus - 1
             };
@@ -2459,17 +3639,39 @@ fn handle_wallet_auditor_key(state: &mut TuiState, key: KeyEvent) {
             2 => {
                 state.auditor_address_index.pop();
             }
+            3 => {
+                state.auditor_expected_input.pop();
+                recompute_auditor_match(state);
+            }
             _ => {}
         },
+        KeyCode::Char('C') | KeyCode::Char('c')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            copy_wallet_link_payload(state);
+        }
+        KeyCode::Char('C') | KeyCode::Char('c') if state.auditor_focus != 3 => {
+            copy_wallet_link_payload(state);
+        }
         KeyCode::Enter => submit_wallet_auditor_derivation(state),
+        KeyCode::Char('V') | KeyCode::Char('v') if state.auditor_focus != 3 => {
+            submit_wallet_auditor_verification(state)
+        }
         KeyCode::Char(value) => match state.auditor_focus {
             0 => match value {
                 '[' => cycle_wallet_auditor_chain(state, false),
                 ']' => cycle_wallet_auditor_chain(state, true),
+                'n' | 'N' => toggle_auditor_network(state),
                 _ => {}
             },
             1 => edit_wallet_auditor_number(&mut state.auditor_account_index, value),
             2 => edit_wallet_auditor_number(&mut state.auditor_address_index, value),
+            3 => {
+                if state.auditor_expected_input.len() < 128 {
+                    state.auditor_expected_input.push(value);
+                    recompute_auditor_match(state);
+                }
+            }
             _ => {}
         },
         _ => {}
@@ -2491,8 +3693,11 @@ fn handle_wallet_auditor_mouse(state: &mut TuiState, mouse: MouseEvent, area: Re
         .split(area);
 
     if point_in_rect(mouse.column, mouse.row, chunks[3]) {
-        if mouse.column < chunks[3].x + chunks[3].width / 2 {
+        let third = chunks[3].width / 3;
+        if mouse.column < chunks[3].x + third {
             submit_wallet_auditor_derivation(state);
+        } else if mouse.column < chunks[3].x + third.saturating_mul(2) {
+            copy_wallet_link_payload(state);
         } else {
             state.screen = Screen::Dashboard;
         }
@@ -2632,7 +3837,12 @@ fn handle_sandbox_manager_key(state: &mut TuiState, key: KeyEvent) {
                 state.sandbox_payload_path.push(value);
             } else if value.is_ascii_digit() {
                 active_sandbox_field_mut(state).push(value);
-=======
+            }
+        }
+        _ => {}
+    }
+}
+
 fn reload_nodes_manager(state: &mut TuiState) {
     state.nodes = NodeRegistry::load_from_path(&nodes::default_nodes_path());
     state.nodes_chains = state.nodes.chain_names();
@@ -2715,6 +3925,13 @@ fn handle_nodes_manager_key(state: &mut TuiState, key: KeyEvent) {
             reload_nodes_manager(state);
             state.status = "Catalogo de nodos recargado desde disco.".to_string();
         }
+        KeyCode::Char('M') | KeyCode::Char('m') => {
+            let profile = state.nodes.cycle_profile();
+            state.status = format!(
+                "Perfil Web3 activo: {}. Pulse G para guardar nodes.toml.",
+                profile.label()
+            );
+        }
         KeyCode::Char('G') | KeyCode::Char('g') => {
             match state.nodes.save_to_path(&nodes::default_nodes_path()) {
                 Ok(()) => state.status = "nodes.toml guardado en disco.".to_string(),
@@ -2730,14 +3947,12 @@ fn handle_nodes_manager_key(state: &mut TuiState, key: KeyEvent) {
                     let _ = write_system_clipboard(&endpoint);
                     state.status = "Endpoint copiado al portapapeles.".to_string();
                 }
->>>>>>> origin/feature/dev-alexander
             }
         }
         _ => {}
     }
 }
 
-<<<<<<< HEAD
 fn handle_sandbox_manager_mouse(state: &mut TuiState, mouse: MouseEvent, area: Rect) {
     if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         return;
@@ -2796,8 +4011,37 @@ fn submit_signing_authorization(state: &mut TuiState, approve: bool) {
     };
 }
 
-=======
->>>>>>> origin/feature/dev-alexander
+fn handle_broadcast_authorization_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::F(10) | KeyCode::Char('A') | KeyCode::Char('a') => {
+            submit_broadcast_authorization(state, true);
+        }
+        KeyCode::Esc | KeyCode::Char('D') | KeyCode::Char('d') => {
+            submit_broadcast_authorization(state, false);
+        }
+        _ => {
+            state.status = "Broadcast pendiente: F10/A autoriza, Esc/D rechaza.".to_string();
+        }
+    }
+}
+
+fn submit_broadcast_authorization(state: &mut TuiState, approve: bool) {
+    let Some(preview) = state.pending_broadcast_preview.take() else {
+        return;
+    };
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::AuthorizeBroadcast {
+            request_id: preview.request_id,
+            approve,
+        });
+    }
+    state.status = if approve {
+        "Broadcast Web3 autorizado; enviando a la red blockchain.".to_string()
+    } else {
+        "Broadcast Web3 rechazado por operador.".to_string()
+    };
+}
+
 fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
     if state.show_breaker_reset {
         handle_wallet_gateway_reset_key(state, key);
@@ -2806,13 +4050,48 @@ fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Dashboard,
-        KeyCode::Tab => state.gateway_focused_field = (state.gateway_focused_field + 1) % 4,
+        KeyCode::Tab => state.gateway_focused_field = (state.gateway_focused_field + 1) % 8,
         KeyCode::BackTab => {
             state.gateway_focused_field = state.gateway_focused_field.saturating_sub(1);
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             state.show_breaker_reset = true;
             state.reset_focus_index = 0;
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            state.screen = Screen::Web3AccountPolicies;
+            load_selected_policy_into_form(state);
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') => {
+            state.screen = Screen::Web3ScheduledRules;
+        }
+        KeyCode::Char('$') => {
+            state.screen = Screen::Web3PriceOracle;
+        }
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            state.screen = Screen::Web3RpcInspector;
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            state.screen = Screen::NodesManager;
+            reload_nodes_manager(state);
+        }
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            state.screen = Screen::Web3AccountEditor;
+            load_selected_policy_into_form(state);
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            let profile = state.nodes.cycle_profile();
+            state.system_notification = format!(
+                "Perfil Web3 cambiado a {}. Pulse G en Nodos para persistir.",
+                profile.label()
+            );
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
+            state.gateway_network = match state.gateway_network {
+                Network::Mainnet => Network::Testnet,
+                Network::Testnet => Network::Mainnet,
+            };
+            state.system_notification = format!("Red gateway: {:?}", state.gateway_network);
         }
         KeyCode::Backspace => match state.gateway_focused_field {
             0 => {
@@ -2822,9 +4101,21 @@ fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
                 state.input_max_volume.pop();
             }
             2 => {
-                state.input_new_dex_id.pop();
+                state.input_max_fiat_value.pop();
             }
             3 => {
+                state.input_fiat_currency.pop();
+            }
+            4 => {
+                state.input_price_asset.pop();
+            }
+            5 => {
+                state.input_price_value.pop();
+            }
+            6 => {
+                state.input_new_dex_id.pop();
+            }
+            7 => {
                 state.input_new_cex_id.pop();
             }
             _ => {}
@@ -2842,11 +4133,32 @@ fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
                 }
             }
             2 => {
+                if (value.is_ascii_digit() || value == '.') && state.input_max_fiat_value.len() < 12
+                {
+                    state.input_max_fiat_value.push(value);
+                }
+            }
+            3 => {
+                if value.is_ascii_alphabetic() && state.input_fiat_currency.len() < 8 {
+                    state.input_fiat_currency.push(value.to_ascii_uppercase());
+                }
+            }
+            4 => {
+                if value.is_ascii_alphanumeric() && state.input_price_asset.len() < 32 {
+                    state.input_price_asset.push(value.to_ascii_uppercase());
+                }
+            }
+            5 => {
+                if (value.is_ascii_digit() || value == '.') && state.input_price_value.len() < 16 {
+                    state.input_price_value.push(value);
+                }
+            }
+            6 => {
                 if state.input_new_dex_id.len() < 96 {
                     state.input_new_dex_id.push(value);
                 }
             }
-            3 => {
+            7 => {
                 if state.input_new_cex_id.len() < 96 {
                     state.input_new_cex_id.push(value);
                 }
@@ -2859,20 +4171,49 @@ fn handle_wallet_gateway_key(state: &mut TuiState, key: KeyEvent) {
 
 fn submit_wallet_gateway_field(state: &mut TuiState) {
     match state.gateway_focused_field {
-        0 | 1 => {
+        0 | 1 | 2 | 3 => {
             let max_tx = state.input_max_tx.trim().parse::<u32>().ok();
             let max_vol = state.input_max_volume.trim().parse::<Decimal>().ok();
-            if max_tx.is_none() && max_vol.is_none() {
+            let max_fiat = state.input_max_fiat_value.trim().parse::<Decimal>().ok();
+            let fiat_currency = state.input_fiat_currency.trim().to_uppercase();
+            if max_tx.is_none()
+                && max_vol.is_none()
+                && max_fiat.is_none()
+                && fiat_currency.is_empty()
+            {
                 state.system_notification = "Error: formato numerico invalido.".to_string();
                 return;
             }
             if let Some(tx) = &state.web3_cmd_tx {
-                let _ = tx.send(Web3WorkerCmd::UpdateRules { max_tx, max_vol });
+                let _ = tx.send(Web3WorkerCmd::UpdateRules {
+                    max_tx,
+                    max_vol,
+                    max_fiat,
+                    fiat_currency: if fiat_currency.is_empty() {
+                        None
+                    } else {
+                        Some(fiat_currency)
+                    },
+                });
             } else {
                 state.system_notification = "Web3 no inicializado.".to_string();
             }
         }
-        2 => {
+        4 | 5 => {
+            let asset = state.input_price_asset.trim().to_uppercase();
+            let fiat = state.input_fiat_currency.trim().to_uppercase();
+            let value = state.input_price_value.trim().parse::<Decimal>().ok();
+            let Some(value) = value else {
+                state.system_notification = "Error: precio manual invalido.".to_string();
+                return;
+            };
+            if let Some(tx) = &state.web3_cmd_tx {
+                let _ = tx.send(Web3WorkerCmd::SetManualPrice { asset, fiat, value });
+            } else {
+                state.system_notification = "Web3 no inicializado.".to_string();
+            }
+        }
+        6 => {
             let value = state.input_new_dex_id.trim().to_string();
             if value.is_empty() {
                 return;
@@ -2885,7 +4226,7 @@ fn submit_wallet_gateway_field(state: &mut TuiState) {
                 state.system_notification = "Web3 no inicializado.".to_string();
             }
         }
-        3 => {
+        7 => {
             let value = state.input_new_cex_id.trim().to_string();
             if value.is_empty() {
                 return;
@@ -2896,6 +4237,603 @@ fn submit_wallet_gateway_field(state: &mut TuiState) {
                 state.input_new_cex_id.clear();
             } else {
                 state.system_notification = "Web3 no inicializado.".to_string();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_optional_u32(value: &str) -> Result<Option<u32>, String> {
+    let value = value.trim();
+    if value.is_empty() || value == "*" {
+        return Ok(None);
+    }
+    value
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| "valor numerico opcional invalido".to_string())
+}
+
+fn parse_optional_decimal(value: &str) -> Result<Option<Decimal>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<Decimal>()
+        .map(Some)
+        .map_err(|_| "decimal opcional invalido".to_string())
+}
+
+fn parse_optional_u64(value: &str) -> Result<Option<u64>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| "entero opcional invalido".to_string())
+}
+
+fn parse_policy_window(value: &str) -> PolicyWindow {
+    match value.trim().to_lowercase().as_str() {
+        "semanal" | "weekly" => PolicyWindow::Weekly,
+        "mensual" | "monthly" => PolicyWindow::Monthly,
+        other if other.starts_with("custom:") => other
+            .trim_start_matches("custom:")
+            .parse::<u64>()
+            .map(PolicyWindow::CustomSeconds)
+            .unwrap_or_default(),
+        _ => PolicyWindow::Daily,
+    }
+}
+
+fn policy_chain_options() -> [ChainType; 6] {
+    [
+        ChainType::Bitcoin,
+        ChainType::Ethereum,
+        ChainType::Solana,
+        ChainType::Monero,
+        ChainType::Zcash,
+        ChainType::Starknet,
+    ]
+}
+
+fn selected_policy_chain(state: &TuiState) -> ChainType {
+    policy_chain_options()
+        .get(state.web3_policy_chain_index)
+        .cloned()
+        .unwrap_or(ChainType::Ethereum)
+}
+
+fn selected_rpc_chain_name(state: &TuiState) -> String {
+    format!(
+        "{:?}",
+        policy_chain_options()
+            .get(state.web3_rpc_chain_index)
+            .cloned()
+            .unwrap_or(ChainType::Ethereum)
+    )
+}
+
+fn comma_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn load_selected_policy_into_form(state: &mut TuiState) {
+    let Some(policy) = state
+        .account_policies
+        .get(state.web3_policy_selected)
+        .cloned()
+    else {
+        return;
+    };
+    state.web3_policy_chain_index = policy_chain_options()
+        .iter()
+        .position(|chain| *chain == policy.chain)
+        .unwrap_or(1);
+    state.web3_policy_account_index = policy.account_index.to_string();
+    state.web3_policy_address_index = policy
+        .address_index
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    state.web3_policy_label = policy.label;
+    state.web3_policy_max_tx = policy.max_tx_per_window.to_string();
+    state.web3_policy_max_crypto = policy
+        .max_native_amount
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    state.web3_policy_max_fiat = policy
+        .max_fiat_value
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    state.web3_policy_fiat_currency = policy.fiat_currency;
+    state.web3_policy_require_confirmation = policy.require_local_confirmation;
+    state.web3_policy_destination_input = policy.allowed_destinations.join(", ");
+    state.web3_policy_contract_input = policy.allowed_contracts.join(", ");
+    if let Some((asset, limit)) = policy.max_asset_amounts.iter().next() {
+        state.web3_policy_asset_input = asset.clone();
+        state.web3_policy_asset_limit_input = limit.to_string();
+    }
+}
+
+fn build_account_policy_from_state(state: &TuiState) -> Result<AccountPolicy, String> {
+    let chain = selected_policy_chain(state);
+    let account_index = state
+        .web3_policy_account_index
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "cuenta invalida".to_string())?;
+    let address_index = parse_optional_u32(&state.web3_policy_address_index)?;
+    let max_tx = state
+        .web3_policy_max_tx
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "max TX invalido".to_string())?;
+    let mut max_asset_amounts = HashMap::new();
+    if let Some(asset_limit) = parse_optional_decimal(&state.web3_policy_asset_limit_input)? {
+        let asset = state.web3_policy_asset_input.trim().to_uppercase();
+        if !asset.is_empty() {
+            max_asset_amounts.insert(asset, asset_limit);
+        }
+    }
+    Ok(AccountPolicy {
+        chain,
+        account_index,
+        address_index,
+        label: state.web3_policy_label.trim().to_string(),
+        max_tx_per_window: max_tx,
+        max_native_amount: parse_optional_decimal(&state.web3_policy_max_crypto)?,
+        max_asset_amounts,
+        max_fiat_value: parse_optional_decimal(&state.web3_policy_max_fiat)?,
+        max_fiat_value_per_tx: None,
+        max_fee_native: state
+            .account_policies
+            .iter()
+            .find(|policy| {
+                policy.chain == selected_policy_chain(state)
+                    && policy.account_index == account_index
+                    && policy.address_index == address_index
+            })
+            .and_then(|policy| policy.max_fee_native),
+        fiat_currency: state.web3_policy_fiat_currency.trim().to_uppercase(),
+        allowed_destinations: comma_list(&state.web3_policy_destination_input),
+        allowed_contracts: comma_list(&state.web3_policy_contract_input),
+        scheduled_rules: state
+            .account_policies
+            .iter()
+            .find(|policy| {
+                policy.chain == selected_policy_chain(state)
+                    && policy.account_index
+                        == state
+                            .web3_policy_account_index
+                            .trim()
+                            .parse::<u32>()
+                            .unwrap_or(u32::MAX)
+                    && policy.address_index == address_index
+            })
+            .map(|policy| policy.scheduled_rules.clone())
+            .unwrap_or_default(),
+        require_local_confirmation: state.web3_policy_require_confirmation,
+    })
+}
+
+fn submit_web3_account_policy(state: &mut TuiState) {
+    match build_account_policy_from_state(state) {
+        Ok(policy) => {
+            if let Some(tx) = &state.web3_cmd_tx {
+                let _ = tx.send(Web3WorkerCmd::UpsertAccountPolicy(policy));
+            } else {
+                state.system_notification = "Web3 no inicializado.".to_string();
+            }
+        }
+        Err(error) => state.system_notification = error,
+    }
+}
+
+fn remove_selected_web3_account_policy(state: &mut TuiState) {
+    let Some(policy) = state
+        .account_policies
+        .get(state.web3_policy_selected)
+        .cloned()
+    else {
+        state.system_notification = "No hay politica seleccionada.".to_string();
+        return;
+    };
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RemoveAccountPolicy {
+            chain: policy.chain,
+            account_index: policy.account_index,
+            address_index: policy.address_index,
+        });
+    }
+}
+
+fn policy_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.web3_policy_focus {
+        1 => Some(&mut state.web3_policy_account_index),
+        2 => Some(&mut state.web3_policy_address_index),
+        3 => Some(&mut state.web3_policy_label),
+        4 => Some(&mut state.web3_policy_max_tx),
+        5 => Some(&mut state.web3_policy_max_crypto),
+        6 => Some(&mut state.web3_policy_max_fiat),
+        7 => Some(&mut state.web3_policy_fiat_currency),
+        9 => Some(&mut state.web3_policy_destination_input),
+        10 => Some(&mut state.web3_policy_contract_input),
+        11 => Some(&mut state.web3_policy_asset_input),
+        12 => Some(&mut state.web3_policy_asset_limit_input),
+        _ => None,
+    }
+}
+
+fn edit_policy_field_char(state: &mut TuiState, value: char) {
+    if state.web3_policy_focus == 0 {
+        let count = policy_chain_options().len();
+        if value == '[' {
+            state.web3_policy_chain_index = state.web3_policy_chain_index.saturating_sub(1);
+        } else if value == ']' {
+            state.web3_policy_chain_index = (state.web3_policy_chain_index + 1) % count;
+        }
+        return;
+    }
+    if state.web3_policy_focus == 8 {
+        if value == ' ' {
+            state.web3_policy_require_confirmation = !state.web3_policy_require_confirmation;
+        }
+        return;
+    }
+    let kind = focused_field_kind(state);
+    if let Some(field) = policy_field_mut(state) {
+        sanitize_into_field(kind, field, &value.to_string(), 160);
+    }
+}
+
+fn handle_web3_account_policies_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::WalletGateway,
+        KeyCode::Tab => state.web3_policy_focus = (state.web3_policy_focus + 1) % 13,
+        KeyCode::BackTab => {
+            state.web3_policy_focus = state.web3_policy_focus.saturating_sub(1);
+        }
+        KeyCode::Up => {
+            state.web3_policy_selected = state.web3_policy_selected.saturating_sub(1);
+            load_selected_policy_into_form(state);
+        }
+        KeyCode::Down => {
+            if state.web3_policy_selected + 1 < state.account_policies.len() {
+                state.web3_policy_selected += 1;
+                load_selected_policy_into_form(state);
+            }
+        }
+        KeyCode::Left => {
+            if state.web3_policy_focus == 0 {
+                state.web3_policy_chain_index = state.web3_policy_chain_index.saturating_sub(1);
+            }
+        }
+        KeyCode::Right => {
+            if state.web3_policy_focus == 0 {
+                state.web3_policy_chain_index =
+                    (state.web3_policy_chain_index + 1) % policy_chain_options().len();
+            }
+        }
+        KeyCode::Enter => submit_web3_account_policy(state),
+        KeyCode::Delete => remove_selected_web3_account_policy(state),
+        KeyCode::Char('s') | KeyCode::Char('S') => state.screen = Screen::Web3ScheduledRules,
+        KeyCode::Char(' ') if state.web3_policy_focus == 8 => {
+            state.web3_policy_require_confirmation = !state.web3_policy_require_confirmation;
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = policy_field_mut(state) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(value) => edit_policy_field_char(state, value),
+        _ => {}
+    }
+}
+
+fn selected_policy_identity(state: &TuiState) -> Result<(ChainType, u32, Option<u32>), String> {
+    let chain = selected_policy_chain(state);
+    let account_index = state
+        .web3_policy_account_index
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| "cuenta invalida".to_string())?;
+    let address_index = parse_optional_u32(&state.web3_policy_address_index)?;
+    Ok((chain, account_index, address_index))
+}
+
+fn build_scheduled_policy_from_state(state: &TuiState) -> Result<ScheduledPolicy, String> {
+    let (chain, account_index, address_index) = selected_policy_identity(state)?;
+    let max_tx = state
+        .web3_schedule_max_tx
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(1);
+    Ok(ScheduledPolicy {
+        name: state.web3_schedule_name.trim().to_string(),
+        enabled: true,
+        chain,
+        account_index,
+        address_index,
+        asset: state.web3_schedule_asset.trim().to_uppercase(),
+        destination: state.web3_schedule_destination.trim().to_string(),
+        max_tx,
+        max_asset_amount: parse_optional_decimal(&state.web3_schedule_max_asset)?,
+        max_fiat_value: parse_optional_decimal(&state.web3_schedule_max_fiat)?,
+        fiat_currency: state.web3_schedule_currency.trim().to_uppercase(),
+        window: parse_policy_window(&state.web3_schedule_window),
+        expires_unix: parse_optional_u64(&state.web3_schedule_expires_unix)?,
+        require_local_confirmation: true,
+    })
+}
+
+fn schedule_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.web3_schedule_focus {
+        0 => Some(&mut state.web3_schedule_name),
+        1 => Some(&mut state.web3_schedule_asset),
+        2 => Some(&mut state.web3_schedule_destination),
+        3 => Some(&mut state.web3_schedule_max_tx),
+        4 => Some(&mut state.web3_schedule_max_asset),
+        5 => Some(&mut state.web3_schedule_max_fiat),
+        6 => Some(&mut state.web3_schedule_currency),
+        7 => Some(&mut state.web3_schedule_window),
+        8 => Some(&mut state.web3_schedule_expires_unix),
+        _ => None,
+    }
+}
+
+fn submit_web3_scheduled_rule(state: &mut TuiState) {
+    let Ok((chain, account_index, address_index)) = selected_policy_identity(state) else {
+        state.system_notification = "Seleccione primero una politica valida.".to_string();
+        return;
+    };
+    match build_scheduled_policy_from_state(state) {
+        Ok(rule) => {
+            if let Some(tx) = &state.web3_cmd_tx {
+                let _ = tx.send(Web3WorkerCmd::AddScheduledPolicy {
+                    chain,
+                    account_index,
+                    address_index,
+                    rule,
+                });
+            }
+        }
+        Err(error) => state.system_notification = error,
+    }
+}
+
+fn remove_web3_scheduled_rule(state: &mut TuiState) {
+    let Ok((chain, account_index, address_index)) = selected_policy_identity(state) else {
+        return;
+    };
+    let name = state.web3_schedule_name.trim().to_string();
+    if name.is_empty() {
+        state.system_notification = "Indique el nombre de la regla a eliminar.".to_string();
+        return;
+    }
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RemoveScheduledPolicy {
+            chain,
+            account_index,
+            address_index,
+            name,
+        });
+    }
+}
+
+fn handle_web3_scheduled_rules_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::Web3AccountPolicies,
+        KeyCode::Tab => state.web3_schedule_focus = (state.web3_schedule_focus + 1) % 9,
+        KeyCode::BackTab => {
+            state.web3_schedule_focus = state.web3_schedule_focus.saturating_sub(1);
+        }
+        KeyCode::Enter => submit_web3_scheduled_rule(state),
+        KeyCode::Delete => remove_web3_scheduled_rule(state),
+        KeyCode::Backspace => {
+            if let Some(field) = schedule_field_mut(state) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(value) => {
+            let kind = focused_field_kind(state);
+            if let Some(field) = schedule_field_mut(state) {
+                sanitize_into_field(kind, field, &value.to_string(), 160);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn price_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.web3_price_focus {
+        0 => Some(&mut state.web3_price_asset),
+        1 => Some(&mut state.web3_price_fiat),
+        2 => Some(&mut state.web3_price_value),
+        3 => Some(&mut state.web3_price_max_age_seconds),
+        4 => Some(&mut state.web3_price_import_path),
+        _ => None,
+    }
+}
+
+fn submit_web3_manual_price(state: &mut TuiState) {
+    let Ok(value) = state.web3_price_value.trim().parse::<Decimal>() else {
+        state.system_notification = "Precio invalido.".to_string();
+        return;
+    };
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::SetManualPrice {
+            asset: state.web3_price_asset.trim().to_uppercase(),
+            fiat: state.web3_price_fiat.trim().to_uppercase(),
+            value,
+        });
+    }
+}
+
+fn handle_web3_price_oracle_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::WalletGateway,
+        KeyCode::Tab => state.web3_price_focus = (state.web3_price_focus + 1) % 5,
+        KeyCode::BackTab => state.web3_price_focus = state.web3_price_focus.saturating_sub(1),
+        KeyCode::Up => state.web3_price_selected = state.web3_price_selected.saturating_sub(1),
+        KeyCode::Down => {
+            if state.web3_price_selected + 1 < state.price_quotes.len() {
+                state.web3_price_selected += 1;
+            }
+        }
+        KeyCode::Enter => submit_web3_manual_price(state),
+        KeyCode::Char('i') | KeyCode::Char('I') => {
+            let path = state.web3_price_import_path.clone();
+            submit_lvcprices_import(state, &path);
+        }
+        KeyCode::Backspace => {
+            if let Some(field) = price_field_mut(state) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(value) => {
+            let kind = focused_field_kind(state);
+            if kind == FieldKind::Text {
+                // Activo/FIAT en mayúsculas; ruta de import conserva mayúsculas/minúsculas.
+                let preserve_case = state.web3_price_focus == 4;
+                if let Some(field) = price_field_mut(state) {
+                    if field.chars().count() < 256 {
+                        field.push(if preserve_case {
+                            value
+                        } else {
+                            value.to_ascii_uppercase()
+                        });
+                    }
+                }
+            } else if let Some(field) = price_field_mut(state) {
+                sanitize_into_field(kind, field, &value.to_string(), 256);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Envia el fichero de precios firmado al worker (verificacion Ed25519 + antiguedad en backend).
+fn submit_lvcprices_import(state: &mut TuiState, path_text: &str) {
+    let trimmed = path_text.trim();
+    if trimmed.is_empty() {
+        state.system_notification =
+            "Indique la ruta del fichero .lvcprices (campo Ruta import).".to_string();
+        return;
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    if !path.is_file() {
+        state.system_notification = "Ruta .lvcprices no encontrada.".to_string();
+        return;
+    }
+    match &state.web3_cmd_tx {
+        Some(tx) => {
+            let _ = tx.send(Web3WorkerCmd::ImportSignedPriceFile { path });
+            state.system_notification =
+                "Importacion .lvcprices enviada; verificando firma Ed25519 en backend.".to_string();
+        }
+        None => {
+            state.system_notification =
+                "Web3 no inicializado: no se puede importar precios.".to_string();
+        }
+    }
+}
+
+fn rpc_field_mut(state: &mut TuiState) -> Option<&mut String> {
+    match state.web3_rpc_focus {
+        1 => Some(&mut state.web3_rpc_address),
+        2 => Some(&mut state.web3_rpc_asset),
+        3 => Some(&mut state.web3_rpc_tx_status),
+        _ => None,
+    }
+}
+
+fn request_rpc_balance(state: &mut TuiState) {
+    if !state.nodes.profile().allows_rpc_read() {
+        state.web3_rpc_status = "Perfil OFFLINE: lectura RPC bloqueada.".to_string();
+        return;
+    }
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RpcReadBalance {
+            chain: selected_rpc_chain_name(state),
+            address: state.web3_rpc_address.clone(),
+            asset: state.web3_rpc_asset.clone(),
+        });
+    }
+}
+
+fn request_rpc_nonce(state: &mut TuiState) {
+    if !state.nodes.profile().allows_rpc_read() {
+        state.web3_rpc_status = "Perfil OFFLINE: lectura RPC bloqueada.".to_string();
+        return;
+    }
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RpcReadNonce {
+            chain: selected_rpc_chain_name(state),
+            address: state.web3_rpc_address.clone(),
+        });
+    }
+}
+
+fn request_rpc_fee(state: &mut TuiState) {
+    if !state.nodes.profile().allows_rpc_read() {
+        state.web3_rpc_status = "Perfil OFFLINE: lectura RPC bloqueada.".to_string();
+        return;
+    }
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RpcEstimateFee {
+            chain: selected_rpc_chain_name(state),
+            raw_payload: Vec::new(),
+        });
+    }
+}
+
+fn request_rpc_tx_status(state: &mut TuiState) {
+    if !state.nodes.profile().allows_rpc_read() {
+        state.web3_rpc_status = "Perfil OFFLINE: lectura RPC bloqueada.".to_string();
+        return;
+    }
+    if let Some(tx) = &state.web3_cmd_tx {
+        let _ = tx.send(Web3WorkerCmd::RpcReadTxStatus {
+            chain: selected_rpc_chain_name(state),
+            txid: state.web3_rpc_tx_status.clone(),
+        });
+    }
+}
+
+fn handle_web3_rpc_inspector_key(state: &mut TuiState, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => state.screen = Screen::WalletGateway,
+        KeyCode::Tab => state.web3_rpc_focus = (state.web3_rpc_focus + 1) % 4,
+        KeyCode::BackTab => state.web3_rpc_focus = state.web3_rpc_focus.saturating_sub(1),
+        KeyCode::Left if state.web3_rpc_focus == 0 => {
+            state.web3_rpc_chain_index = state.web3_rpc_chain_index.saturating_sub(1);
+        }
+        KeyCode::Right if state.web3_rpc_focus == 0 => {
+            state.web3_rpc_chain_index =
+                (state.web3_rpc_chain_index + 1) % policy_chain_options().len();
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') => request_rpc_balance(state),
+        KeyCode::Char('n') | KeyCode::Char('N') => request_rpc_nonce(state),
+        KeyCode::Char('f') | KeyCode::Char('F') => request_rpc_fee(state),
+        KeyCode::Char('t') | KeyCode::Char('T') => request_rpc_tx_status(state),
+        KeyCode::Backspace => {
+            if let Some(field) = rpc_field_mut(state) {
+                field.pop();
+            }
+        }
+        KeyCode::Char(value) => {
+            if let Some(field) = rpc_field_mut(state) {
+                if field.len() < 160 {
+                    field.push(value);
+                }
             }
         }
         _ => {}
@@ -4267,15 +6205,11 @@ fn append_unique_until_limit(target: &mut Vec<String>, values: Vec<String>, limi
 fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => state.screen = Screen::Dashboard,
-<<<<<<< HEAD
-        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % SETTINGS_FIELD_COUNT,
-=======
         KeyCode::Char('N') => {
             state.screen = Screen::NodesManager;
             reload_nodes_manager(state);
         }
-        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % 10,
->>>>>>> origin/feature/dev-alexander
+        KeyCode::Tab => state.settings_focus = (state.settings_focus + 1) % SETTINGS_FIELD_COUNT,
         KeyCode::BackTab => {
             state.settings_focus = if state.settings_focus == 0 {
                 SETTINGS_FIELD_COUNT - 1
@@ -4318,6 +6252,7 @@ fn handle_settings_key(state: &mut TuiState, key: KeyEvent) {
         KeyCode::Char('D') => set_duress_key_from_settings(state),
         KeyCode::Char('P') => enable_apparmor_from_settings(state),
         KeyCode::Char('U') => disable_apparmor_from_settings(state),
+        KeyCode::Char('Z') => toggle_destructive_auditor_reauth(state),
         KeyCode::Char(value) => {
             if matches!(state.settings_focus, 0..=4 | 7..=11 | 13..=17) {
                 let target = match state.settings_focus {
@@ -4644,11 +6579,14 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
         Screen::RecoveryMode => draw_recovery_mode(frame, inner, state),
         Screen::InstallProfile => draw_install_profile(frame, inner),
         Screen::WalletGateway => draw_wallet_gateway(frame, inner, state),
-<<<<<<< HEAD
         Screen::WalletAuditor => draw_wallet_auditor(frame, inner, state),
-=======
         Screen::NodesManager => draw_nodes_manager(frame, inner, state),
->>>>>>> origin/feature/dev-alexander
+        Screen::Web3AccountPolicies | Screen::Web3AccountEditor => {
+            draw_web3_account_policies(frame, inner, state)
+        }
+        Screen::Web3ScheduledRules => draw_web3_scheduled_rules(frame, inner, state),
+        Screen::Web3PriceOracle => draw_web3_price_oracle(frame, inner, state),
+        Screen::Web3RpcInspector => draw_web3_rpc_inspector(frame, inner, state),
     }
 
     if state.show_file_browser {
@@ -4671,6 +6609,12 @@ fn draw_ui(frame: &mut Frame<'_>, state: &TuiState) {
     }
     if let Some(preview) = &state.pending_signing_preview {
         draw_signing_authorization_modal(frame, inner, preview);
+    }
+    if let Some(preview) = &state.pending_broadcast_preview {
+        draw_broadcast_authorization_modal(frame, inner, preview);
+    }
+    if state.show_reauth_modal {
+        draw_reauth_modal(frame, inner, state);
     }
 }
 
@@ -4737,6 +6681,13 @@ fn draw_signing_authorization_modal(
             "Volumen efectivo parseado: {}",
             preview.effective_volume_units
         )),
+        Line::from(format!(
+            "Comision estimada: {}",
+            preview
+                .fee_estimate
+                .as_deref()
+                .unwrap_or("no disponible (OFFLINE o sin nodo)")
+        )),
         Line::from(""),
         Line::from(Span::styled(
             "Resumen parseado por backend:",
@@ -4753,6 +6704,126 @@ fn draw_signing_authorization_modal(
         .block(
             Block::default()
                 .title(" Confirmacion fisica de firma ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(modal, popup);
+}
+
+fn draw_broadcast_authorization_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    preview: &BroadcastRequestPreview,
+) {
+    let popup = centered_area(area, 78, 44);
+    frame.render_widget(Clear, popup);
+    let lines = vec![
+        Line::from(Span::styled(
+            "AUTORIZACION DE BROADCAST - PASARELA WEB3",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "ID solicitud: {} | Red: {:?}",
+            preview.request_id, preview.chain
+        )),
+        Line::from(format!(
+            "Tamano payload firmado: {} bytes",
+            preview.payload_len
+        )),
+        Line::from(format!("SHA-256 payload: {}", preview.payload_sha256)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "El envio a la red blockchain es IRREVERSIBLE.",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "F10/A autoriza y difunde | Esc/D rechaza y responde error al socket",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+    ];
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Confirmacion fisica de broadcast ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    frame.render_widget(modal, popup);
+}
+
+fn draw_reauth_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let popup = centered_area(area, 72, 56);
+    frame.render_widget(Clear, popup);
+    let focus = |idx: usize| {
+        if state.reauth_focus == idx {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "RE-CONFIRMACION BOOT SHIELD",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from("Introduzca cajas y frase maestra para autorizar la accion del auditor."),
+        Line::from(Span::styled(
+            "Verificacion read-only por defecto (modo destructivo configurable en Ajustes, tecla Z).",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(""),
+    ];
+    for (idx, caja) in state.reauth_cajas.iter().enumerate() {
+        let masked: String = "*".repeat(caja.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(format!("Caja {}: ", idx + 1), focus(idx)),
+            Span::raw(masked),
+        ]));
+    }
+    let masked_phrase: String = "*".repeat(state.reauth_phrase.chars().count());
+    lines.push(Line::from(vec![
+        Span::styled("Frase: ", focus(5)),
+        Span::raw(masked_phrase),
+    ]));
+    if state.unlock_requires_secondary() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "DOBLE CREDENCIAL (secundaria):",
+            Style::default().fg(Color::Cyan),
+        )));
+        for (idx, caja) in state.reauth_secondary_cajas.iter().enumerate() {
+            let masked: String = "*".repeat(caja.chars().count());
+            lines.push(Line::from(vec![
+                Span::styled(format!("Caja B{}: ", idx + 1), focus(6 + idx)),
+                Span::raw(masked),
+            ]));
+        }
+        let masked_secondary: String = "*".repeat(state.reauth_secondary_phrase.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled("Frase B: ", focus(11)),
+            Span::raw(masked_secondary),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab cambia campo | Enter confirma | Esc cancela",
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+    )));
+    let modal = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Verificacion de identidad ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow)),
         )
@@ -5248,10 +7319,23 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .unwrap_or_else(|_| "desconocido".to_string())
         )),
         ListItem::new(format!(
-            "Pasarela Web3: {} | firmas hoy: {} | volumen: {:.8} unidades",
+            "Pasarela Web3: {} | TX hoy: {} | cripto/token: {:.8} | fiat: {:.2} {}",
             gateway_state_label(&state.cached_gateway_state),
             state.cached_tx_count,
-            state.cached_volume_units
+            state.cached_volume_units,
+            state.cached_fiat_value,
+            state.input_fiat_currency
+        )),
+        ListItem::new(format!(
+            "Politicas cuenta: {} | reglas programadas activas: {} | perfil: {}",
+            state.account_policies.len(),
+            state
+                .account_policies
+                .iter()
+                .flat_map(|policy| policy.scheduled_rules.iter())
+                .filter(|rule| rule.enabled)
+                .count(),
+            state.nodes.profile().label()
         )),
         ListItem::new("w = pasarela Web3 / custodia"),
         ListItem::new("k = auditor visual de direcciones publicas"),
@@ -5298,9 +7382,7 @@ fn qr_lines(data: &str) -> Vec<Line<'static>> {
         };
         let mut text = String::new();
         for (x, top_char) in top.chars().enumerate() {
-            let bottom_char = bottom
-                .and_then(|row| row.chars().nth(x))
-                .unwrap_or(' ');
+            let bottom_char = bottom.and_then(|row| row.chars().nth(x)).unwrap_or(' ');
             let block = match (top_char == '#', bottom_char == '#') {
                 (true, true) => '\u{2588}',
                 (true, false) => '\u{2580}',
@@ -5325,13 +7407,16 @@ fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         ])
         .split(area);
 
-    let header = Paragraph::new("GESTION DE INFRAESTRUCTURA DE NODOS")
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
+    let header = Paragraph::new(format!(
+        "GESTION DE INFRAESTRUCTURA DE NODOS | PERFIL WEB3: {}",
+        state.nodes.profile().label()
+    ))
+    .alignment(Alignment::Center)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
     frame.render_widget(header, chunks[0]);
 
     let body = Layout::default()
@@ -5347,7 +7432,11 @@ fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .iter()
             .enumerate()
             .map(|(idx, name)| {
-                let marker = if idx == state.nodes_selected { ">" } else { " " };
+                let marker = if idx == state.nodes_selected {
+                    ">"
+                } else {
+                    " "
+                };
                 ListItem::new(format!("{} {}", marker, name))
             })
             .collect()
@@ -5363,17 +7452,37 @@ fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     if let Some(chain) = state.nodes_chains.get(state.nodes_selected) {
         let endpoints = state.nodes.endpoints(chain);
         let active = state.nodes.active_index(chain);
+        let clock_status = state.nodes.offline_verified_clock();
         detail.push(Line::from(Span::styled(
             format!("Cadena: {}", chain),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )));
+        detail.push(Line::from(format!(
+            "Perfil: {} | timeout RPC: {} ms | drift max: {} s",
+            state.nodes.profile().label(),
+            state.nodes.timeout_ms(),
+            state.nodes.max_clock_drift_seconds()
+        )));
+        detail.push(Line::from(format!("Estado reloj: {}", clock_status.status)));
         detail.push(Line::from(""));
         for (idx, endpoint) in endpoints.iter().enumerate() {
             let marker = if idx == active { "[x]" } else { "[ ]" };
             let role = if idx == 0 { "principal" } else { "respaldo" };
             detail.push(Line::from(format!("{} {} ({})", marker, endpoint, role)));
+        }
+        if let Some(policy) = state.nodes.endpoint_policy(chain) {
+            detail.push(Line::from(""));
+            detail.push(Line::from(format!(
+                "Politica endpoint: broadcast={} | chain_id requerido='{}'",
+                if policy.allow_broadcast { "si" } else { "no" },
+                if policy.require_chain_id.is_empty() {
+                    "pendiente"
+                } else {
+                    &policy.require_chain_id
+                }
+            )));
         }
         detail.push(Line::from(""));
         if state.nodes_editing {
@@ -5399,7 +7508,7 @@ fn draw_nodes_manager(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(detail_panel, body[1]);
 
     let footer = Paragraph::new(
-        "Flechas navegan | Espacio cambia nodo activo | E edita | G guarda | R recarga | Ctrl+C copia | Esc vuelve",
+        "Flechas navegan | Espacio cambia nodo activo | M perfil | E edita | G guarda | R recarga | Ctrl+C copia | Esc",
     )
     .alignment(Alignment::Center)
     .block(
@@ -5466,7 +7575,25 @@ fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         }
     };
 
+    let clock_status = state.nodes.offline_verified_clock();
     let left = Paragraph::new(vec![
+        Line::from(vec![
+            Span::raw("Perfil Web3: "),
+            Span::styled(
+                state.nodes.profile().label(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   M cambia perfil"),
+        ]),
+        Line::from(vec![
+            Span::raw(format!("Red: {:?}", state.gateway_network)),
+            Span::raw(format!(
+                "   chain_id ETH: {}   Y cambia red",
+                address::chain_id_label_for(&ChainType::Ethereum, state.gateway_network)
+            )),
+        ]),
         Line::from(vec![
             Span::raw("Transacciones hoy: "),
             Span::styled(
@@ -5477,13 +7604,29 @@ fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ),
         ]),
         Line::from(vec![
-            Span::raw("Volumen diario consumido: "),
+            Span::raw("Cantidad cripto/token hoy: "),
             Span::styled(
-                format!("{:.8} unidades", state.cached_volume_units),
+                format!("{:.8}", state.cached_volume_units),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
+        ]),
+        Line::from(vec![
+            Span::raw("Valor fiat estimado hoy: "),
+            Span::styled(
+                format!(
+                    "{:.2} {}",
+                    state.cached_fiat_value, state.input_fiat_currency
+                ),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("Reloj verificado: "),
+            Span::styled(clock_status.status, Style::default().fg(Color::Gray)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -5495,15 +7638,31 @@ fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             Span::raw(&state.input_max_tx),
         ]),
         Line::from(vec![
-            Span::styled("[2] Techo diario unidades: ", field_style(1)),
+            Span::styled("[2] Max cripto/token diario: ", field_style(1)),
             Span::raw(&state.input_max_volume),
         ]),
         Line::from(vec![
-            Span::styled("[3] Nuevo DEX ID: ", field_style(2)),
+            Span::styled("[3] Max valor fiat diario: ", field_style(2)),
+            Span::raw(&state.input_max_fiat_value),
+        ]),
+        Line::from(vec![
+            Span::styled("[4] Moneda fiat: ", field_style(3)),
+            Span::raw(&state.input_fiat_currency),
+        ]),
+        Line::from(vec![
+            Span::styled("[5] Activo precio manual: ", field_style(4)),
+            Span::raw(&state.input_price_asset),
+        ]),
+        Line::from(vec![
+            Span::styled("[6] Precio manual activo/FIAT: ", field_style(5)),
+            Span::raw(&state.input_price_value),
+        ]),
+        Line::from(vec![
+            Span::styled("[7] Nuevo DEX ID: ", field_style(6)),
             Span::raw(&state.input_new_dex_id),
         ]),
         Line::from(vec![
-            Span::styled("[4] Nuevo CEX ID: ", field_style(3)),
+            Span::styled("[8] Nuevo CEX ID: ", field_style(7)),
             Span::raw(&state.input_new_cex_id),
         ]),
         Line::from(""),
@@ -5522,7 +7681,11 @@ fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let list_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
+        ])
         .split(body_chunks[1]);
 
     let dex_items = gateway_list_items(&state.allowed_dex_contracts, "Sin contratos DEX.");
@@ -5541,8 +7704,15 @@ fn draw_wallet_gateway(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     );
     frame.render_widget(cex_list, list_chunks[1]);
 
+    let price_list = List::new(gateway_price_items(&state.price_quotes)).block(
+        Block::default()
+            .title(" Precios manuales/offline ")
+            .borders(Borders::ALL),
+    );
+    frame.render_widget(price_list, list_chunks[2]);
+
     let footer = Paragraph::new(
-        "Tab/clic navega | Enter confirma | R rearma disyuntor | Esc vuelve al dashboard",
+        "P politicas | S reglas | $ precios | I inspector | N nodos | M perfil | Y red | R rearme | Ctrl+V/doble-clic pega | Esc",
     )
     .alignment(Alignment::Center)
     .block(
@@ -5565,6 +7735,415 @@ fn gateway_list_items<'a>(items: &'a [String], empty: &'a str) -> Vec<ListItem<'
         .iter()
         .map(|id| ListItem::new(format!("  - {}", id)))
         .collect()
+}
+
+fn gateway_price_items<'a>(items: &'a [PriceQuote]) -> Vec<ListItem<'a>> {
+    if items.is_empty() {
+        return vec![ListItem::new(
+            "Sin precios manuales. Configure activo y precio.",
+        )];
+    }
+    items
+        .iter()
+        .rev()
+        .take(8)
+        .map(|quote| {
+            ListItem::new(format!(
+                "  - {}/{} = {} ({})",
+                quote.asset, quote.fiat, quote.value, quote.source
+            ))
+        })
+        .collect()
+}
+
+fn draw_web3_account_policies(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+
+    let header = Paragraph::new("POLITICAS WEB3 POR CUENTA")
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    frame.render_widget(header, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+            Constraint::Percentage(30),
+        ])
+        .split(chunks[1]);
+
+    let items = if state.account_policies.is_empty() {
+        vec![ListItem::new("Sin politicas por cuenta.")]
+    } else {
+        state
+            .account_policies
+            .iter()
+            .enumerate()
+            .map(|(idx, policy)| {
+                let marker = if idx == state.web3_policy_selected {
+                    ">"
+                } else {
+                    " "
+                };
+                ListItem::new(format!(
+                    "{} {:?} cuenta {} indice {:?} - {}",
+                    marker, policy.chain, policy.account_index, policy.address_index, policy.label
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(items).block(Block::default().title(" Politicas ").borders(Borders::ALL)),
+        body[0],
+    );
+
+    let focus = |idx: usize| {
+        if state.web3_policy_focus == idx {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let form = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("[0] Red: ", focus(0)),
+            Span::raw(format!("{:?}", selected_policy_chain(state))),
+            Span::raw("  [ / ] cambia"),
+        ]),
+        Line::from(vec![
+            Span::styled("[1] Cuenta: ", focus(1)),
+            Span::raw(&state.web3_policy_account_index),
+        ]),
+        Line::from(vec![
+            Span::styled("[2] Indice: ", focus(2)),
+            Span::raw(if state.web3_policy_address_index.is_empty() {
+                "*"
+            } else {
+                &state.web3_policy_address_index
+            }),
+        ]),
+        Line::from(vec![
+            Span::styled("[3] Etiqueta: ", focus(3)),
+            Span::raw(&state.web3_policy_label),
+        ]),
+        Line::from(vec![
+            Span::styled("[4] Max TX: ", focus(4)),
+            Span::raw(&state.web3_policy_max_tx),
+        ]),
+        Line::from(vec![
+            Span::styled("[5] Max cripto/token: ", focus(5)),
+            Span::raw(&state.web3_policy_max_crypto),
+        ]),
+        Line::from(vec![
+            Span::styled("[6] Max FIAT: ", focus(6)),
+            Span::raw(&state.web3_policy_max_fiat),
+        ]),
+        Line::from(vec![
+            Span::styled("[7] Moneda: ", focus(7)),
+            Span::raw(&state.web3_policy_fiat_currency),
+        ]),
+        Line::from(vec![
+            Span::styled("[8] Confirmacion local: ", focus(8)),
+            Span::raw(if state.web3_policy_require_confirmation {
+                "si"
+            } else {
+                "no"
+            }),
+        ]),
+    ])
+    .block(Block::default().title(" Editor ").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(form, body[1]);
+
+    let side = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("[9] Destinos: ", focus(9)),
+            Span::raw(&state.web3_policy_destination_input),
+        ]),
+        Line::from(vec![
+            Span::styled("[10] Contratos: ", focus(10)),
+            Span::raw(&state.web3_policy_contract_input),
+        ]),
+        Line::from(vec![
+            Span::styled("[11] Activo: ", focus(11)),
+            Span::raw(&state.web3_policy_asset_input),
+        ]),
+        Line::from(vec![
+            Span::styled("[12] Limite activo: ", focus(12)),
+            Span::raw(&state.web3_policy_asset_limit_input),
+        ]),
+        Line::from(""),
+        Line::from("Destinos/contratos separados por coma."),
+        Line::from("S abre reglas programadas."),
+    ])
+    .block(Block::default().title(" Listas ").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(side, body[2]);
+
+    let footer = Paragraph::new(
+        "Enter guarda | Delete elimina | Tab campo | Flechas seleccionan | S reglas | Esc pasarela",
+    )
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn draw_web3_scheduled_rules(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let header = Paragraph::new("REGLAS PROGRAMADAS WEB3")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    let focus = |idx: usize| {
+        if state.web3_schedule_focus == idx {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(chunks[1]);
+    let current_rules = state
+        .account_policies
+        .get(state.web3_policy_selected)
+        .map(|policy| policy.scheduled_rules.clone())
+        .unwrap_or_default();
+    let list_items = if current_rules.is_empty() {
+        vec![ListItem::new("Sin reglas para la politica seleccionada.")]
+    } else {
+        current_rules
+            .iter()
+            .enumerate()
+            .map(|(idx, rule)| {
+                let marker = if idx == state.web3_schedule_selected {
+                    ">"
+                } else {
+                    " "
+                };
+                ListItem::new(format!(
+                    "{} {} {} -> {}",
+                    marker, rule.name, rule.asset, rule.destination
+                ))
+            })
+            .collect()
+    };
+    frame.render_widget(
+        List::new(list_items).block(Block::default().title(" Reglas ").borders(Borders::ALL)),
+        body[0],
+    );
+
+    let form = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("[0] Nombre: ", focus(0)),
+            Span::raw(&state.web3_schedule_name),
+        ]),
+        Line::from(vec![
+            Span::styled("[1] Activo: ", focus(1)),
+            Span::raw(&state.web3_schedule_asset),
+        ]),
+        Line::from(vec![
+            Span::styled("[2] Destino: ", focus(2)),
+            Span::raw(&state.web3_schedule_destination),
+        ]),
+        Line::from(vec![
+            Span::styled("[3] Max TX: ", focus(3)),
+            Span::raw(&state.web3_schedule_max_tx),
+        ]),
+        Line::from(vec![
+            Span::styled("[4] Max activo: ", focus(4)),
+            Span::raw(&state.web3_schedule_max_asset),
+        ]),
+        Line::from(vec![
+            Span::styled("[5] Max FIAT: ", focus(5)),
+            Span::raw(&state.web3_schedule_max_fiat),
+        ]),
+        Line::from(vec![
+            Span::styled("[6] Moneda: ", focus(6)),
+            Span::raw(&state.web3_schedule_currency),
+        ]),
+        Line::from(vec![
+            Span::styled("[7] Ventana: ", focus(7)),
+            Span::raw(&state.web3_schedule_window),
+        ]),
+        Line::from(vec![
+            Span::styled("[8] Caduca UNIX: ", focus(8)),
+            Span::raw(&state.web3_schedule_expires_unix),
+        ]),
+    ])
+    .block(Block::default().title(" Editor ").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(form, body[1]);
+
+    let footer =
+        Paragraph::new("Enter guarda | Delete elimina por nombre | Tab campo | Esc politicas")
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, chunks[2]);
+}
+
+fn draw_web3_price_oracle(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let header = Paragraph::new("ORACULO DE PRECIOS WEB3")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+    let prices = gateway_price_items(&state.price_quotes);
+    frame.render_widget(
+        List::new(prices).block(Block::default().title(" Precios ").borders(Borders::ALL)),
+        body[0],
+    );
+    let focus = |idx: usize| {
+        if state.web3_price_focus == idx {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let form = Paragraph::new(vec![
+        Line::from("Modo actual: OFFLINE MANUAL"),
+        Line::from(vec![
+            Span::styled("[0] Activo: ", focus(0)),
+            Span::raw(&state.web3_price_asset),
+        ]),
+        Line::from(vec![
+            Span::styled("[1] Fiat: ", focus(1)),
+            Span::raw(&state.web3_price_fiat),
+        ]),
+        Line::from(vec![
+            Span::styled("[2] Valor: ", focus(2)),
+            Span::raw(&state.web3_price_value),
+        ]),
+        Line::from(vec![
+            Span::styled("[3] Max edad s: ", focus(3)),
+            Span::raw(&state.web3_price_max_age_seconds),
+        ]),
+        Line::from(vec![
+            Span::styled("[4] Ruta import: ", focus(4)),
+            Span::raw(&state.web3_price_import_path),
+        ]),
+        Line::from(""),
+        Line::from(format!("Fuente: {}", state.web3_price_source)),
+        Line::from("I: importar .lvcprices firmado (verificacion Ed25519 en backend)."),
+    ])
+    .block(Block::default().title(" Editor ").borders(Borders::ALL))
+    .wrap(Wrap { trim: false });
+    frame.render_widget(form, body[1]);
+    frame.render_widget(
+        Paragraph::new(
+            "Enter guarda precio manual | I importar firmado | Tab campo | Esc pasarela",
+        )
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
+}
+
+fn draw_web3_rpc_inspector(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(area);
+    let header = Paragraph::new(format!(
+        "INSPECTOR RPC | PERFIL {}",
+        state.nodes.profile().label()
+    ))
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(header, chunks[0]);
+    let focus = |idx: usize| {
+        if state.web3_rpc_focus == idx {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+    let body = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("[0] Red: ", focus(0)),
+            Span::raw(selected_rpc_chain_name(state)),
+            Span::raw("  ←/→ cambia"),
+        ]),
+        Line::from(vec![
+            Span::styled("[1] Direccion: ", focus(1)),
+            Span::raw(&state.web3_rpc_address),
+        ]),
+        Line::from(vec![
+            Span::styled("[2] Activo: ", focus(2)),
+            Span::raw(&state.web3_rpc_asset),
+        ]),
+        Line::from(vec![
+            Span::styled("[3] TXID/estado: ", focus(3)),
+            Span::raw(&state.web3_rpc_tx_status),
+        ]),
+        Line::from(""),
+        Line::from(format!("Balance: {}", state.web3_rpc_balance)),
+        Line::from(format!("Nonce: {}", state.web3_rpc_nonce)),
+        Line::from(format!("Fee: {}", state.web3_rpc_fee)),
+        Line::from(""),
+        Line::from(Span::styled(
+            &state.web3_rpc_status,
+            Style::default().fg(Color::Magenta),
+        )),
+    ])
+    .block(
+        Block::default()
+            .title(" Lectura controlada ")
+            .borders(Borders::ALL),
+    )
+    .wrap(Wrap { trim: false });
+    frame.render_widget(body, chunks[1]);
+    frame.render_widget(
+        Paragraph::new("B balance | N nonce | F fee | T estado TX | Tab campo | Esc pasarela")
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL)),
+        chunks[2],
+    );
 }
 
 fn draw_wallet_gateway_reset_modal(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -5678,7 +8257,8 @@ fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled("[Red] ", focused(0)),
             Span::raw(format!("{:?}", selected_auditor_chain(state))),
-            Span::raw("   use ←/→ o clic"),
+            Span::raw(format!("  red:{:?}  ", state.auditor_network)),
+            Span::raw("←/→ cadena · n red"),
         ]),
         Line::from(vec![
             Span::styled("[Cuenta] ", focused(1)),
@@ -5688,9 +8268,16 @@ fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(vec![
             Span::styled("[Indice] ", focused(2)),
             Span::raw(&state.auditor_address_index),
-            Span::raw("   Enter deriva"),
+            Span::raw("   Enter deriva · V verifica"),
         ]),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Verificar] ", focused(3)),
+            Span::raw(if state.auditor_expected_input.is_empty() {
+                "(teclee la direccion esperada)"
+            } else {
+                &state.auditor_expected_input
+            }),
+        ]),
         Line::from(Span::styled(
             &state.auditor_status,
             Style::default().fg(Color::Magenta),
@@ -5708,7 +8295,44 @@ fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
         .split(chunks[2]);
 
+    let selected_chain = selected_auditor_chain(state);
+    let account_index = state
+        .auditor_account_index
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    let address_index = state
+        .auditor_address_index
+        .trim()
+        .parse::<u32>()
+        .unwrap_or(0);
+    let derivation_path = derivation_path_label(&selected_chain, account_index, address_index);
     let mut details = vec![
+        Line::from(vec![
+            Span::styled("Red: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:?}", selected_chain)),
+        ]),
+        Line::from(vec![
+            Span::styled("Cuenta: ", Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{} - cuenta logica HD", account_index)),
+        ]),
+        Line::from(vec![
+            Span::styled("Indice direccion: ", Style::default().fg(Color::Cyan)),
+            Span::raw(address_index.to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Ruta: ", Style::default().fg(Color::Cyan)),
+            Span::raw(derivation_path),
+        ]),
+        Line::from(vec![
+            Span::styled("Soporte: ", Style::default().fg(Color::Cyan)),
+            Span::raw(chain_support_status(&selected_chain)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("chain_id: ", Style::default().fg(Color::Cyan)),
+            Span::raw(address::chain_id_label_for(&selected_chain, state.auditor_network)),
+        ]),
         Line::from(vec![
             Span::styled("Direccion / etiqueta: ", Style::default().fg(Color::Cyan)),
             Span::raw(if state.auditor_address.is_empty() {
@@ -5717,12 +8341,29 @@ fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 &state.auditor_address
             }),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Clave publica hexadecimal:",
-            Style::default().fg(Color::Cyan),
-        )),
     ];
+    if !state.auditor_segwit_address.is_empty() {
+        details.push(Line::from(vec![
+            Span::styled("SegWit (bech32): ", Style::default().fg(Color::Cyan)),
+            Span::raw(&state.auditor_segwit_address),
+        ]));
+    }
+    if !state.auditor_match_status.is_empty() {
+        let color = if state.auditor_match_status.starts_with("OK") {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        details.push(Line::from(vec![
+            Span::styled("Verificacion: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&state.auditor_match_status, Style::default().fg(color)),
+        ]));
+    }
+    details.push(Line::from(""));
+    details.push(Line::from(Span::styled(
+        "Clave publica hexadecimal:",
+        Style::default().fg(Color::Cyan),
+    )));
     if state.auditor_public_key_hex.is_empty() {
         details.push(Line::from("pendiente"));
     } else {
@@ -5733,32 +8374,62 @@ fn draw_wallet_auditor(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             details.push(Line::from(line));
         }
     }
+    details.push(Line::from(""));
+    details.extend(account_policy_label(
+        &state.account_policies,
+        &selected_chain,
+        account_index,
+        address_index,
+        &state.input_max_tx,
+        &state.input_max_fiat_value,
+        &state.input_fiat_currency,
+    ));
     let details_box = Paragraph::new(details)
         .block(
             Block::default()
-                .title(" Resultado criptografico ")
+                .title(" Resultado criptografico y politica ")
                 .borders(Borders::ALL),
         )
         .wrap(Wrap { trim: false });
     frame.render_widget(details_box, body[0]);
 
-    let fingerprint_source = if state.auditor_address.is_empty() {
-        "LIVENCRYPT-AUDITOR-PENDING"
-    } else {
-        &state.auditor_address
-    };
-    let fingerprint = Paragraph::new(address_fingerprint_lines(fingerprint_source))
-        .alignment(Alignment::Center)
-        .block(
+    let right_panel = if let Some(payload) = wallet_qr_payload(state) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "QR ASCII individual",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(format!(
+                "{:?} cuenta {} indice {}",
+                selected_chain, account_index, address_index
+            )),
+            Line::from(""),
+        ];
+        lines.extend(qr_lines(&payload));
+        lines.push(Line::from(""));
+        lines.push(Line::from("C / Ctrl+C copia el vinculo publico completo."));
+        Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
-                .title(" Huella visual ")
+                .title(" QR wallet / vinculo publico ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
-        );
-    frame.render_widget(fingerprint, body[1]);
+        )
+    } else {
+        Paragraph::new(address_fingerprint_lines("LIVENCRYPT-AUDITOR-PENDING"))
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .title(" Huella visual ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            )
+    };
+    frame.render_widget(right_panel, body[1]);
 
     let footer = Paragraph::new(
-        "Enter deriva | Tab campo | ←/→ red | +/- indices | clic deriva/volver | Esc dashboard",
+        "Enter deriva | V verifica | C copia | n red | Tab campo | +/- indices | [Verificar] Ctrl+V/doble-clic pega direccion | Esc",
     )
     .alignment(Alignment::Center)
     .block(
@@ -6439,7 +9110,7 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let hardening = security::process_hardening::process_hardening_status();
     let apparmor = security::apparmor::apparmor_status();
     let lines = vec![
-        Line::from("clic/Tab campos | PgUp/PgDown scroll | B Boot ON | O OFF | D coaccion | S red | T inactividad | P AppArmor ON | U OFF | Esc"),
+        Line::from("clic/Tab campos | PgUp/PgDown scroll | B Boot ON | O OFF | D coaccion | S red | T inactividad | P AppArmor ON | U OFF | Z reauth destructiva | Esc"),
         Line::from(""),
         Line::from(format!(
             "SECCION: ACCESO | modo vault actual: {}",
@@ -6475,6 +9146,19 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             if state.inactivity_enabled { "ON" } else { "OFF" },
             state.inactivity_timeout_seconds
         )),
+        Line::from(""),
+        Line::from("SECCION: PROTECCION WALLETS (AUDITOR)"),
+        Line::from(format!(
+            "Re-auth destructiva auditor (tecla Z): {}",
+            if state.settings_destructive_auditor_reauth {
+                "ON"
+            } else {
+                "OFF"
+            }
+        )),
+        Line::from(
+            "Si ON, un fallo en la re-confirmacion del auditor DESTRUYE el vault (exige backup externo).",
+        ),
         Line::from(""),
         Line::from("SECCION: RED (solo configuracion, no se ejecutan pruebas de red)"),
         Line::from(format!("{} perfil: {}", marker(state.settings_focus == 19), state.settings_network_profile)),
@@ -6618,7 +9302,7 @@ fn draw_audit_monitor(frame: &mut Frame<'_>, area: Rect) {
 
     let list = List::new(items).block(
         Block::default()
-            .title(" Auditoria avanzada - Esc vuelve ")
+            .title(" Auditoria avanzada - V verifica cadena Web3 firmada | Esc vuelve ")
             .borders(Borders::ALL),
     );
     frame.render_widget(list, area);
@@ -6908,4 +9592,52 @@ fn centered_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(vertical[1])[1]
+}
+
+#[cfg(test)]
+mod field_input_tests {
+    use super::{sanitize_into_field, FieldKind};
+
+    fn apply(kind: FieldKind, current: &str, input: &str) -> String {
+        let mut field = current.to_string();
+        sanitize_into_field(kind, &mut field, input, 64);
+        field
+    }
+
+    #[test]
+    fn integer_field_accepts_only_digits() {
+        assert_eq!(apply(FieldKind::Integer, "", "12ab3"), "123");
+        assert_eq!(apply(FieldKind::Integer, "", "-5"), "5");
+        assert_eq!(apply(FieldKind::Integer, "", "1.5"), "15");
+    }
+
+    #[test]
+    fn signed_integer_allows_leading_minus_only() {
+        assert_eq!(apply(FieldKind::SignedInteger, "", "-42"), "-42");
+        assert_eq!(apply(FieldKind::SignedInteger, "1", "-2"), "12");
+        assert_eq!(apply(FieldKind::SignedInteger, "", "9-9"), "99");
+    }
+
+    #[test]
+    fn decimal_field_accepts_digits_and_single_separator() {
+        assert_eq!(apply(FieldKind::Decimal, "", "12.34"), "12.34");
+        assert_eq!(apply(FieldKind::Decimal, "", "1,5"), "1.5");
+        assert_eq!(apply(FieldKind::Decimal, "", "1.2.3"), "1.23");
+        assert_eq!(apply(FieldKind::Decimal, "", "0xBTC9"), "09");
+    }
+
+    #[test]
+    fn text_field_accepts_text_numbers_and_special_chars() {
+        assert_eq!(
+            apply(FieldKind::Text, "", "0xAbC_123-!@#"),
+            "0xAbC_123-!@#"
+        );
+        // Los caracteres de control (saltos de línea) se descartan.
+        assert_eq!(apply(FieldKind::Text, "", "a\nb\tc"), "abc");
+    }
+
+    #[test]
+    fn respects_max_len() {
+        assert_eq!(apply(FieldKind::Text, "abcd", &"x".repeat(100)).len(), 64);
+    }
 }

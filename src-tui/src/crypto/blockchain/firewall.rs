@@ -3,7 +3,9 @@
 /* rol: cortafuegos de politicas en caliente y listas blancas */
 
 use crate::crypto::blockchain::tx_parser::{native_units, ParsedDestinationKind, ParsedTx};
-use crate::crypto::blockchain::types::{ChainType, TxMethod};
+use crate::crypto::blockchain::types::{
+    AccountPolicy, ChainType, PriceBook, PriceQuote, ScheduledPolicy, TxMethod,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -12,7 +14,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FirewallRules {
     pub max_daily_tx: u32,
+    #[serde(default)]
     pub max_daily_volume_units: Decimal,
+    #[serde(default)]
+    pub max_daily_crypto_amount: Decimal,
+    #[serde(default)]
+    pub max_daily_fiat_value: Decimal,
+    #[serde(default = "default_fiat_currency")]
+    pub fiat_currency: String,
     pub allowed_dex_contracts: Vec<String>,
     pub allowed_cex_destinations: Vec<String>,
     pub allowed_erc20_contracts: Vec<String>,
@@ -20,6 +29,10 @@ pub struct FirewallRules {
     /// Decimales registrados por dirección de contrato ERC-20.
     /// Sin registro en `token_decimals`, la transacción ERC-20 es rechazada.
     pub token_decimals: HashMap<String, u8>,
+    #[serde(default)]
+    pub account_policies: Vec<AccountPolicy>,
+    #[serde(default)]
+    pub price_book: PriceBook,
 }
 
 impl Default for FirewallRules {
@@ -27,19 +40,33 @@ impl Default for FirewallRules {
         Self {
             max_daily_tx: 10,
             max_daily_volume_units: Decimal::new(5000, 0),
+            max_daily_crypto_amount: Decimal::new(5000, 0),
+            max_daily_fiat_value: Decimal::new(5000, 0),
+            fiat_currency: default_fiat_currency(),
             allowed_dex_contracts: Vec::new(),
             allowed_cex_destinations: Vec::new(),
             allowed_erc20_contracts: Vec::new(),
             allowed_chain_ids: vec![0, 1, 501],
             token_decimals: HashMap::new(),
+            account_policies: Vec::new(),
+            price_book: PriceBook::default(),
         }
     }
+}
+
+fn default_fiat_currency() -> String {
+    "USD".to_string()
 }
 
 pub struct LiveFirewall {
     pub rules: FirewallRules,
     pub tx_count_today: u32,
     pub volume_today_units: Decimal,
+    pub crypto_amount_today: Decimal,
+    pub fiat_value_today: Decimal,
+    pub native_amount_by_chain: HashMap<String, Decimal>,
+    pub asset_amount_by_token: HashMap<String, Decimal>,
+    pub fiat_value_by_currency: HashMap<String, Decimal>,
     pub last_reset_timestamp: u64,
     reset_instant: Instant,
 }
@@ -56,6 +83,11 @@ impl LiveFirewall {
             rules,
             tx_count_today: 0,
             volume_today_units: Decimal::ZERO,
+            crypto_amount_today: Decimal::ZERO,
+            fiat_value_today: Decimal::ZERO,
+            native_amount_by_chain: HashMap::new(),
+            asset_amount_by_token: HashMap::new(),
+            fiat_value_by_currency: HashMap::new(),
             last_reset_timestamp: now_unix(),
             reset_instant: Instant::now(),
         }
@@ -67,6 +99,11 @@ impl LiveFirewall {
         if self.reset_instant.elapsed() >= Duration::from_secs(86_400) {
             self.tx_count_today = 0;
             self.volume_today_units = Decimal::ZERO;
+            self.crypto_amount_today = Decimal::ZERO;
+            self.fiat_value_today = Decimal::ZERO;
+            self.native_amount_by_chain.clear();
+            self.asset_amount_by_token.clear();
+            self.fiat_value_by_currency.clear();
             self.reset_instant = Instant::now();
             self.last_reset_timestamp = now_unix();
         }
@@ -114,6 +151,12 @@ impl LiveFirewall {
             return Err(format!(
                 "umbral de volumen excedido desde payload real: limite diario de {} unidades",
                 self.rules.max_daily_volume_units
+            ));
+        }
+        if projected_volume > self.rules.max_daily_crypto_amount {
+            return Err(format!(
+                "umbral cripto excedido desde payload real: limite diario de {} activos/token",
+                self.rules.max_daily_crypto_amount
             ));
         }
 
@@ -201,6 +244,177 @@ impl LiveFirewall {
         Ok(())
     }
 
+    pub fn validate_account_policy(
+        &self,
+        parsed: &ParsedTx,
+        account_index: u32,
+        address_index: u32,
+        effective_volume: Decimal,
+        fiat_value: Decimal,
+        fiat_currency: &str,
+    ) -> Result<(), String> {
+        let Some(policy) = self.active_policy(&parsed.chain, account_index, address_index) else {
+            return self.validate_global_fiat_limit(fiat_value, fiat_currency);
+        };
+
+        if self.tx_count_today >= policy.max_tx_per_window {
+            return Err(format!(
+                "politica de cuenta '{}': limite de {} TX alcanzado",
+                policy.label, policy.max_tx_per_window
+            ));
+        }
+
+        if let Some(max_native) = policy.max_native_amount {
+            let projected = safe_volume_add(self.crypto_amount_today, effective_volume)?;
+            if projected > max_native {
+                return Err(format!(
+                    "politica de cuenta '{}': limite cripto excedido {} > {}",
+                    policy.label, projected, max_native
+                ));
+            }
+        }
+
+        let fiat_currency = fiat_currency.trim().to_uppercase();
+        if let Some(max_fiat) = policy.max_fiat_value {
+            if fiat_value <= Decimal::ZERO {
+                return Err(format!(
+                    "politica de cuenta '{}': valor fiat local requerido para aplicar limite",
+                    policy.label
+                ));
+            }
+            let current = self
+                .fiat_value_by_currency
+                .get(&fiat_currency)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let projected = safe_volume_add(current, fiat_value)?;
+            if projected > max_fiat {
+                return Err(format!(
+                    "politica de cuenta '{}': limite fiat excedido {} {} > {} {}",
+                    policy.label, projected, fiat_currency, max_fiat, fiat_currency
+                ));
+            }
+        } else {
+            self.validate_global_fiat_limit(fiat_value, &fiat_currency)?;
+        }
+
+        for destination in &parsed.destinations {
+            match destination.kind {
+                ParsedDestinationKind::Erc20Contract => {
+                    if !policy.allowed_contracts.is_empty()
+                        && !policy.allowed_contracts.contains(&destination.address)
+                    {
+                        return Err(format!(
+                            "politica de cuenta '{}': contrato no autorizado {}",
+                            policy.label, destination.address
+                        ));
+                    }
+                }
+                ParsedDestinationKind::Native | ParsedDestinationKind::Erc20Receiver => {
+                    if !policy.allowed_destinations.is_empty()
+                        && !policy.allowed_destinations.contains(&destination.address)
+                    {
+                        return Err(format!(
+                            "politica de cuenta '{}': destino no autorizado {}",
+                            policy.label, destination.address
+                        ));
+                    }
+                    if let Some(schedule_error) = self.validate_scheduled_rules(
+                        policy,
+                        parsed,
+                        account_index,
+                        address_index,
+                        &destination.address,
+                        effective_volume,
+                        fiat_value,
+                    ) {
+                        return Err(schedule_error);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_global_fiat_limit(
+        &self,
+        fiat_value: Decimal,
+        fiat_currency: &str,
+    ) -> Result<(), String> {
+        if self.rules.max_daily_fiat_value <= Decimal::ZERO {
+            return Ok(());
+        }
+        if fiat_value <= Decimal::ZERO {
+            return Err(
+                "limite fiat activo: se requiere valoracion local/manual/RPC fiable".to_string(),
+            );
+        }
+        let fiat_currency = fiat_currency.trim().to_uppercase();
+        let current = self
+            .fiat_value_by_currency
+            .get(&fiat_currency)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let projected = safe_volume_add(current, fiat_value)?;
+        if projected > self.rules.max_daily_fiat_value {
+            return Err(format!(
+                "limite fiat diario excedido: {} {} > {} {}",
+                projected, fiat_currency, self.rules.max_daily_fiat_value, fiat_currency
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_scheduled_rules(
+        &self,
+        policy: &AccountPolicy,
+        parsed: &ParsedTx,
+        account_index: u32,
+        address_index: u32,
+        destination: &str,
+        effective_volume: Decimal,
+        fiat_value: Decimal,
+    ) -> Option<String> {
+        let matching = policy.scheduled_rules.iter().find(|rule| {
+            rule.applies_to(&parsed.chain, account_index, address_index, destination)
+        })?;
+        if let Some(expires_unix) = matching.expires_unix {
+            if now_unix() > expires_unix {
+                return Some(format!("regla programada '{}' caducada", matching.name));
+            }
+        }
+        if matching.max_tx > 0 && self.tx_count_today >= matching.max_tx {
+            return Some(format!(
+                "regla programada '{}': limite de {} TX alcanzado",
+                matching.name, matching.max_tx
+            ));
+        }
+        if let Some(max_asset) = matching.max_asset_amount {
+            if effective_volume > max_asset {
+                return Some(format!(
+                    "regla programada '{}': importe {} supera {}",
+                    matching.name, effective_volume, max_asset
+                ));
+            }
+        }
+        if let Some(max_fiat) = matching.max_fiat_value {
+            if fiat_value <= Decimal::ZERO {
+                return Some(format!(
+                    "regla programada '{}': valor fiat requerido",
+                    matching.name
+                ));
+            }
+            if fiat_value > max_fiat {
+                return Some(format!(
+                    "regla programada '{}': fiat {} supera {}",
+                    matching.name, fiat_value, max_fiat
+                ));
+            }
+        }
+        None
+    }
+
     pub fn commit_transaction(&mut self, estimated_volume_units: Decimal) -> Result<(), String> {
         let projected = safe_volume_add(self.volume_today_units, estimated_volume_units)?;
         if projected > self.rules.max_daily_volume_units {
@@ -211,6 +425,171 @@ impl LiveFirewall {
         }
         self.tx_count_today = self.tx_count_today.saturating_add(1);
         self.volume_today_units = projected;
+        self.crypto_amount_today = projected;
+        Ok(())
+    }
+
+    pub fn commit_transaction_context(
+        &mut self,
+        parsed: &ParsedTx,
+        estimated_volume_units: Decimal,
+        fiat_value: Decimal,
+        fiat_currency: &str,
+    ) -> Result<(), String> {
+        self.commit_transaction(estimated_volume_units)?;
+        for (asset, amount) in parsed_asset_amounts(parsed, estimated_volume_units) {
+            let target = if asset.starts_with("native:") {
+                &mut self.native_amount_by_chain
+            } else {
+                &mut self.asset_amount_by_token
+            };
+            let current = target.get(&asset).copied().unwrap_or(Decimal::ZERO);
+            target.insert(asset, safe_volume_add(current, amount)?);
+        }
+        if fiat_value > Decimal::ZERO {
+            let currency = fiat_currency.trim().to_uppercase();
+            let current = self
+                .fiat_value_by_currency
+                .get(&currency)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let projected = safe_volume_add(current, fiat_value)?;
+            self.fiat_value_by_currency.insert(currency, projected);
+            self.fiat_value_today = projected;
+        }
+        Ok(())
+    }
+
+    pub fn active_policy(
+        &self,
+        chain: &ChainType,
+        account_index: u32,
+        address_index: u32,
+    ) -> Option<&AccountPolicy> {
+        self.rules
+            .account_policies
+            .iter()
+            .find(|policy| policy.applies_to(chain, account_index, address_index))
+    }
+
+    pub fn upsert_account_policy(&mut self, policy: AccountPolicy) {
+        self.rules.account_policies.retain(|existing| {
+            !(existing.chain == policy.chain
+                && existing.account_index == policy.account_index
+                && existing.address_index == policy.address_index)
+        });
+        self.rules.account_policies.push(policy);
+    }
+
+    pub fn remove_account_policy(
+        &mut self,
+        chain: &ChainType,
+        account_index: u32,
+        address_index: Option<u32>,
+    ) -> bool {
+        let before = self.rules.account_policies.len();
+        self.rules.account_policies.retain(|policy| {
+            !(policy.chain == *chain
+                && policy.account_index == account_index
+                && policy.address_index == address_index)
+        });
+        self.rules.account_policies.len() != before
+    }
+
+    pub fn add_scheduled_policy(
+        &mut self,
+        chain: &ChainType,
+        account_index: u32,
+        address_index: Option<u32>,
+        rule: ScheduledPolicy,
+    ) -> Result<(), String> {
+        let policy = self
+            .rules
+            .account_policies
+            .iter_mut()
+            .find(|policy| {
+                policy.chain == *chain
+                    && policy.account_index == account_index
+                    && policy.address_index == address_index
+            })
+            .ok_or_else(|| "politica de cuenta no encontrada".to_string())?;
+        policy
+            .scheduled_rules
+            .retain(|existing| existing.name != rule.name);
+        policy.scheduled_rules.push(rule);
+        Ok(())
+    }
+
+    pub fn remove_scheduled_policy(
+        &mut self,
+        chain: &ChainType,
+        account_index: u32,
+        address_index: Option<u32>,
+        name: &str,
+    ) -> bool {
+        let Some(policy) = self.rules.account_policies.iter_mut().find(|policy| {
+            policy.chain == *chain
+                && policy.account_index == account_index
+                && policy.address_index == address_index
+        }) else {
+            return false;
+        };
+        let before = policy.scheduled_rules.len();
+        policy.scheduled_rules.retain(|rule| rule.name != name);
+        policy.scheduled_rules.len() != before
+    }
+
+    pub fn set_crypto_limit(&mut self, value: Decimal) -> Result<(), String> {
+        if value <= Decimal::ZERO {
+            return Err("el limite cripto debe ser mayor a 0".into());
+        }
+        self.rules.max_daily_crypto_amount = value;
+        self.rules.max_daily_volume_units = value;
+        Ok(())
+    }
+
+    pub fn set_fiat_limit(&mut self, value: Decimal, currency: &str) -> Result<(), String> {
+        if value <= Decimal::ZERO {
+            return Err("el limite fiat debe ser mayor a 0".into());
+        }
+        let currency = currency.trim().to_uppercase();
+        if currency.is_empty() || currency.len() > 8 {
+            return Err("moneda fiat invalida".into());
+        }
+        self.rules.max_daily_fiat_value = value;
+        self.rules.fiat_currency = currency;
+        Ok(())
+    }
+
+    pub fn set_manual_price(
+        &mut self,
+        asset: &str,
+        fiat: &str,
+        value: Decimal,
+    ) -> Result<(), String> {
+        let asset = asset.trim().to_uppercase();
+        let fiat = fiat.trim().to_uppercase();
+        if asset.is_empty() || asset.len() > 32 {
+            return Err("activo de precio invalido".into());
+        }
+        if fiat.is_empty() || fiat.len() > 8 {
+            return Err("moneda fiat invalida".into());
+        }
+        if value <= Decimal::ZERO {
+            return Err("precio manual debe ser mayor a 0".into());
+        }
+        self.rules
+            .price_book
+            .quotes
+            .retain(|quote| !(quote.asset == asset && quote.fiat == fiat));
+        self.rules.price_book.primary_fiat = fiat.clone();
+        self.rules.price_book.quotes.push(PriceQuote {
+            asset,
+            fiat,
+            value,
+            timestamp_unix: now_unix(),
+            source: "manual-local".to_string(),
+        });
         Ok(())
     }
 
@@ -247,6 +626,24 @@ impl LiveFirewall {
         }
         Ok(total)
     }
+}
+
+fn parsed_asset_amounts(
+    parsed: &ParsedTx,
+    effective_volume_units: Decimal,
+) -> Vec<(String, Decimal)> {
+    let token_contract = parsed
+        .destinations
+        .iter()
+        .find(|destination| matches!(destination.kind, ParsedDestinationKind::Erc20Contract))
+        .map(|destination| destination.address.clone());
+    if let Some(contract) = token_contract {
+        return vec![(format!("token:{}", contract), effective_volume_units)];
+    }
+    vec![(
+        format!("native:{:?}:{}", parsed.chain, parsed.chain_id),
+        effective_volume_units,
+    )]
 }
 
 fn token_units(value_units: u128, decimals: u8) -> Decimal {

@@ -1,0 +1,279 @@
+diff --git a/src-tui/src/crypto/blockchain/breaker.rs b/src-tui/src/crypto/blockchain/breaker.rs
+index f367034..a456478 100644
+--- a/src-tui/src/crypto/blockchain/breaker.rs
++++ b/src-tui/src/crypto/blockchain/breaker.rs
+@@ -3,6 +3,7 @@
+ /* rol: disyuntor tactico de seguridad, congelacion forense y aislamiento */
+ 
+ use crate::security::vault::derive_vault_key;
++use sha2::{Digest, Sha256};
+ use zeroize::Zeroize;
+ 
+ #[derive(Debug, Clone, PartialEq)]
+@@ -15,6 +16,17 @@ pub enum GatewaySecurityState {
+ pub struct TacticalCircuitBreaker {
+     pub state: GatewaySecurityState,
+     pub integrity_failures: u32,
++    /// Verificador de la combinación exacta (5 cajas + frase maestra) exigida por
++    /// el README para descongelar la pasarela. Se vincula al instanciar el gateway.
++    rearm_verifier: Option<[u8; 32]>,
++}
++
++impl Drop for TacticalCircuitBreaker {
++    fn drop(&mut self) {
++        if let Some(verifier) = self.rearm_verifier.as_mut() {
++            verifier.zeroize();
++        }
++    }
+ }
+ 
+ impl TacticalCircuitBreaker {
+@@ -22,9 +34,22 @@ impl TacticalCircuitBreaker {
+         Self {
+             state: GatewaySecurityState::Operational,
+             integrity_failures: 0,
++            rearm_verifier: None,
+         }
+     }
+ 
++    /// Vincula las credenciales de rearme. Debe llamarse al inicializar la pasarela
++    /// con las MISMAS cajas + frase que generan el llavero. Sin este vínculo, el
++    /// rearme se rechaza (fail-closed) en lugar de aceptar cualquier credencial.
++    pub fn set_rearm_credentials(
++        &mut self,
++        cajas: [i64; 5],
++        master_phrase: &str,
++    ) -> Result<(), String> {
++        self.rearm_verifier = Some(compute_rearm_verifier(cajas, master_phrase)?);
++        Ok(())
++    }
++
+     pub fn trip_breaker(&mut self, reason: &str, timestamp: u64) {
+         self.state = GatewaySecurityState::Frozen {
+             reason: reason.to_string(),
+@@ -48,13 +73,20 @@ impl TacticalCircuitBreaker {
+             );
+         }
+ 
+-        let mut verification_key = derive_vault_key(cajas, master_phrase)?;
+-        if verification_key.is_empty() {
+-            verification_key.zeroize();
++        // Fail-closed: si no hay credenciales vinculadas no se puede autorizar el rearme.
++        let expected = self.rearm_verifier.ok_or_else(|| {
++            "rearme no disponible: pasarela sin credenciales de autorizacion vinculadas".to_string()
++        })?;
++
++        // Comparación en tiempo constante contra la combinación EXACTA registrada.
++        let mut candidate = compute_rearm_verifier(cajas, master_phrase)?;
++        let authorized = constant_time_eq(&candidate, &expected);
++        candidate.zeroize();
++
++        if !authorized {
+             return Err("credenciales de autorizacion locales invalidas".to_string());
+         }
+ 
+-        verification_key.zeroize();
+         self.state = GatewaySecurityState::Operational;
+         self.integrity_failures = 0;
+         Ok(())
+@@ -66,3 +98,93 @@ impl Default for TacticalCircuitBreaker {
+         Self::new()
+     }
+ }
++
++/// Deriva un verificador estable de la combinación (5 cajas + frase maestra) usando
++/// la misma KDF (Argon2id) que protege el llavero, sin retener material de clave en claro.
++fn compute_rearm_verifier(cajas: [i64; 5], master_phrase: &str) -> Result<[u8; 32], String> {
++    let mut key = derive_vault_key(cajas, master_phrase)?;
++    let mut hasher = Sha256::new();
++    hasher.update(b"LIVENCRYPT-BREAKER-REARM-V1");
++    hasher.update(&key);
++    key.zeroize();
++    let mut out = [0u8; 32];
++    out.copy_from_slice(&hasher.finalize());
++    Ok(out)
++}
++
++fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
++    if left.len() != right.len() {
++        return false;
++    }
++    let mut diff = 0u8;
++    for (left_byte, right_byte) in left.iter().zip(right.iter()) {
++        diff |= left_byte ^ right_byte;
++    }
++    diff == 0
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn frozen_breaker() -> TacticalCircuitBreaker {
++        let mut breaker = TacticalCircuitBreaker::new();
++        breaker
++            .set_rearm_credentials([1, 2, 3, 4, 5], "frase maestra de prueba")
++            .expect("vincular credenciales");
++        breaker.trip_breaker("violacion de prueba", 0);
++        breaker
++    }
++
++    #[test]
++    fn rearm_rejects_wrong_credentials() {
++        let mut breaker = frozen_breaker();
++        assert!(matches!(
++            breaker.state,
++            GatewaySecurityState::Frozen { .. }
++        ));
++        // Frase incorrecta -> rechazo.
++        assert!(breaker
++            .resolve_and_reset([1, 2, 3, 4, 5], "frase incorrecta")
++            .is_err());
++        // Cajas incorrectas -> rechazo.
++        assert!(breaker
++            .resolve_and_reset([9, 9, 9, 9, 9], "frase maestra de prueba")
++            .is_err());
++        // El estado sigue congelado tras intentos fallidos.
++        assert!(matches!(
++            breaker.state,
++            GatewaySecurityState::Frozen { .. }
++        ));
++    }
++
++    #[test]
++    fn rearm_accepts_exact_credentials() {
++        let mut breaker = frozen_breaker();
++        breaker
++            .resolve_and_reset([1, 2, 3, 4, 5], "frase maestra de prueba")
++            .expect("rearme con credenciales exactas");
++        assert_eq!(breaker.state, GatewaySecurityState::Operational);
++        assert_eq!(breaker.integrity_failures, 0);
++    }
++
++    #[test]
++    fn rearm_without_bound_credentials_is_rejected() {
++        let mut breaker = TacticalCircuitBreaker::new();
++        breaker.trip_breaker("violacion de prueba", 0);
++        // Sin set_rearm_credentials previo no se puede autorizar (fail-closed).
++        assert!(breaker
++            .resolve_and_reset([1, 2, 3, 4, 5], "cualquier frase")
++            .is_err());
++    }
++
++    #[test]
++    fn hardlocked_breaker_never_rearms() {
++        let mut breaker = frozen_breaker();
++        breaker.trigger_hard_lock();
++        assert!(breaker
++            .resolve_and_reset([1, 2, 3, 4, 5], "frase maestra de prueba")
++            .is_err());
++        assert_eq!(breaker.state, GatewaySecurityState::HardLocked);
++    }
++}
+diff --git a/src-tui/src/crypto/file_cipher.rs b/src-tui/src/crypto/file_cipher.rs
+index 884f24a..878854a 100644
+--- a/src-tui/src/crypto/file_cipher.rs
++++ b/src-tui/src/crypto/file_cipher.rs
+@@ -359,8 +359,13 @@ impl FileCipher {
+             salt,
+             nonce,
+             template_sha256: template_sha256(template)?,
+-            cajas_sha256: cajas_sha256(cajas),
+-            referencia_sha256: sha256_bytes(referencia.as_bytes()),
++            // CWE-916: NO publicar SHA-256 sin sal de valores de baja entropía.
++            // Las cajas y la referencia ya entran en la clave Argon2id+AEAD, así que
++            // estos hashes eran redundantes y permitían fuerza bruta offline (recuperar
++            // cajas/referencia sin pagar el coste del KDF). Se dejan vacíos; el AEAD es
++            // la única autoridad. Los archivos antiguos siguen verificándose (ver decrypt).
++            cajas_sha256: Vec::new(),
++            referencia_sha256: Vec::new(),
+             is_txt_output_hint: false,
+         };
+ 
+@@ -391,10 +396,17 @@ impl FileCipher {
+         if envelope.header.template_sha256 != template_sha256(template)? {
+             return Err("La plantilla no coincide con la usada al cifrar.".to_string());
+         }
+-        if envelope.header.cajas_sha256 != cajas_sha256(cajas) {
++        // Compatibilidad: archivos antiguos llevaban estos hashes; si están presentes
++        // se siguen verificando. Los archivos nuevos los omiten y delegan en el AEAD
++        // (cajas/referencia incorrectas -> fallo de autenticación AEAD igualmente).
++        if !envelope.header.cajas_sha256.is_empty()
++            && envelope.header.cajas_sha256 != cajas_sha256(cajas)
++        {
+             return Err("Las cajas no coinciden con las usadas al cifrar.".to_string());
+         }
+-        if envelope.header.referencia_sha256 != sha256_bytes(referencia.as_bytes()) {
++        if !envelope.header.referencia_sha256.is_empty()
++            && envelope.header.referencia_sha256 != sha256_bytes(referencia.as_bytes())
++        {
+             return Err("La referencia no coincide con la usada al cifrar.".to_string());
+         }
+ 
+diff --git a/src-tui/src/main.rs b/src-tui/src/main.rs
+index c50a47b..d306e13 100644
+--- a/src-tui/src/main.rs
++++ b/src-tui/src/main.rs
+@@ -922,7 +922,12 @@ impl TuiState {
+         let keymaster = UniversalKeymaster::new(cajas, master_phrase)?;
+         let default_rules = FirewallRules::default();
+         let firewall = LiveFirewall::new(default_rules);
+-        let supervisor = GatewaySupervisor::new(keymaster, firewall);
++        let mut supervisor = GatewaySupervisor::new(keymaster, firewall);
++        // Vincula la combinación EXACTA (5 cajas + frase maestra) requerida para
++        // descongelar el disyuntor. Sin esto el rearme aceptaba cualquier credencial.
++        supervisor
++            .breaker
++            .set_rearm_credentials(cajas, master_phrase)?;
+ 
+         self.input_max_tx = supervisor.firewall.rules.max_daily_tx.to_string();
+         self.input_max_volume = supervisor.firewall.rules.max_daily_volume_units.to_string();
+diff --git a/src-tui/tests/file_cipher_tests.rs b/src-tui/tests/file_cipher_tests.rs
+index f1ed4f5..b1170e3 100644
+--- a/src-tui/tests/file_cipher_tests.rs
++++ b/src-tui/tests/file_cipher_tests.rs
+@@ -491,7 +491,9 @@ mod tests {
+         .unwrap_err()
+         .contains("plantilla"));
+ 
+-        assert!(FileCipher::decrypt_file_authenticated(
++        // Cajas incorrectas: ahora se rechazan vía AEAD (las cajas entran en la clave),
++        // sin publicar un hash sin sal fuerza-bruteable de las cajas.
++        let err_cajas = FileCipher::decrypt_file_authenticated(
+             &encrypted_path,
+             &decrypted_path,
+             reference,
+@@ -500,10 +502,15 @@ mod tests {
+             [5, 7, 2, 3, 8],
+             secret,
+         )
+-        .unwrap_err()
+-        .contains("cajas"));
++        .unwrap_err();
++        assert!(
++            err_cajas.contains("cajas")
++                || err_cajas.contains("AEAD")
++                || err_cajas.contains("clave incorrecta")
++        );
+ 
+-        assert!(FileCipher::decrypt_file_authenticated(
++        // Referencia incorrecta: idem, rechazo vía AEAD (la referencia entra en la clave).
++        let err_ref = FileCipher::decrypt_file_authenticated(
+             &encrypted_path,
+             &decrypted_path,
+             "otra referencia segura 2026",
+@@ -512,8 +519,12 @@ mod tests {
+             cajas,
+             secret,
+         )
+-        .unwrap_err()
+-        .contains("referencia"));
++        .unwrap_err();
++        assert!(
++            err_ref.contains("referencia")
++                || err_ref.contains("AEAD")
++                || err_ref.contains("clave incorrecta")
++        );
+ 
+         let _ = std::fs::remove_file(&original_path);
+         let _ = std::fs::remove_file(&encrypted_path);

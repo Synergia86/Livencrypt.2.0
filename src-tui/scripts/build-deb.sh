@@ -6,6 +6,7 @@ VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 
 TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT_DIR/target}"
 PACKAGE_NAME="livencrypt-core"
 DEBIAN_WORK_DIR="$TARGET_DIR/debian"
+DIST_DIR="$ROOT_DIR/dist"
 
 detect_deb_arch() {
   if command -v dpkg >/dev/null 2>&1; then
@@ -27,17 +28,19 @@ detect_deb_arch() {
 
 ARCH="$(detect_deb_arch)"
 BUILD_ROOT="$TARGET_DIR/debian/${PACKAGE_NAME}_${VERSION}_${ARCH}"
-DEB_PATH="$TARGET_DIR/debian/${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
+DEB_PATH="$DIST_DIR/${PACKAGE_NAME}_${VERSION}_${ARCH}.deb"
 
 CARGO_TARGET_DIR="$TARGET_DIR" cargo build --release --locked --manifest-path "$ROOT_DIR/Cargo.toml"
 
 rm -rf "$BUILD_ROOT"
+mkdir -p "$DIST_DIR"
 mkdir -p "$BUILD_ROOT/DEBIAN"
 mkdir -p "$BUILD_ROOT/usr/bin"
 mkdir -p "$BUILD_ROOT/usr/share/doc/$PACKAGE_NAME"
 mkdir -p "$BUILD_ROOT/usr/share/applications"
 mkdir -p "$BUILD_ROOT/usr/share/icons/hicolor/128x128/apps"
 mkdir -p "$BUILD_ROOT/usr/share/livencrypt/apparmor"
+mkdir -p "$BUILD_ROOT/usr/share/livencrypt/extension"
 mkdir -p "$BUILD_ROOT/usr/share/livencrypt/native-messaging"
 mkdir -p "$BUILD_ROOT/usr/share/livencrypt/scripts"
 
@@ -50,6 +53,7 @@ install -m 0644 "$ROOT_DIR/packaging/desktop/livencrypt-core.desktop" "$BUILD_RO
 install -m 0644 "$ROOT_DIR/icons/livencrypt2.0_logo.png" "$BUILD_ROOT/usr/share/icons/hicolor/128x128/apps/livencrypt-core.png"
 install -m 0644 "$ROOT_DIR/packaging/apparmor/livencrypt-core" "$BUILD_ROOT/usr/share/livencrypt/apparmor/livencrypt-core"
 install -m 0644 "$ROOT_DIR/scripts/com.livencrypt.gateway.json" "$BUILD_ROOT/usr/share/livencrypt/native-messaging/com.livencrypt.gateway.json"
+cp -R "$ROOT_DIR/extension/livencrypt-web3" "$BUILD_ROOT/usr/share/livencrypt/extension/livencrypt-web3"
 install -m 0755 "$ROOT_DIR/scripts/initramfs-build.sh" "$BUILD_ROOT/usr/share/livencrypt/scripts/initramfs-build.sh"
 install -m 0755 "$ROOT_DIR/scripts/initramfs-install.sh" "$BUILD_ROOT/usr/share/livencrypt/scripts/initramfs-install.sh"
 

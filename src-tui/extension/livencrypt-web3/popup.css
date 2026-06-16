@@ -1,0 +1,41 @@
+body {
+  width: 380px;
+  margin: 0;
+  padding: 12px;
+  background: #06111f;
+  color: #dbeafe;
+  font-family: system-ui, sans-serif;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid #1e3a5f;
+  padding-bottom: 8px;
+}
+
+h2 {
+  font-size: 12px;
+  margin: 14px 0 8px;
+  color: #67e8f9;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 0;
+  border-bottom: 1px solid #10243a;
+  font-size: 12px;
+}
+
+button {
+  border: 1px solid #155e75;
+  background: #083344;
+  color: #cffafe;
+  border-radius: 4px;
+  padding: 4px 7px;
+  cursor: pointer;
+}

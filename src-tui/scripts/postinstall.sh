@@ -176,6 +176,8 @@ echo "Livencrypt: SHA-256 esperado registrado en $integrity_file."
 echo "Livencrypt: perfil expu instalado: $install_profile."
 echo "Livencrypt: perfil sandbox local configurado en $integrity_dir/sandbox/profile.conf."
 echo "Livencrypt: host de mensajeria nativa registrado como /usr/bin/livencrypt-bridge."
+echo "Livencrypt: extension Web3 disponible en /usr/share/livencrypt/extension/livencrypt-web3."
+echo "Livencrypt: carguela manualmente como extension desempaquetada en Chromium/Brave."
 echo "Livencrypt: AppArmor queda disponible, pero NO se activa automaticamente. Activelo desde Configuracion."
 if [ "$install_profile" = "pba" ]; then
   echo "Livencrypt: PBA seleccionado, pero initramfs NO se activa automaticamente. Use script dedicado y rollback." >&2

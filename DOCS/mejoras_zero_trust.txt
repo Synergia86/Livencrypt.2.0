@@ -1,0 +1,1225 @@
+diff --git a/src-tui/Cargo.toml b/src-tui/Cargo.toml
+index b208115..a8f18d0 100644
+--- a/src-tui/Cargo.toml
++++ b/src-tui/Cargo.toml
+@@ -18,6 +18,7 @@ serde = { version = "1", features = ["derive"] }
+ rand = "0.8"
+ rmp-serde = "1.3"
+ hex = "0.4"
++bs58 = "0.5"
+ flate2 = "1.0"
+ rayon = "1.12.0"
+ zstd = "0.13.3"
+@@ -37,3 +38,6 @@ crossterm = "0.27"
+ ed25519-dalek = "2.1"
+ hmac = "0.12"
+ rust_decimal = "1.35"
++
++[target.'cfg(target_os = "linux")'.dependencies]
++seccompiler = "0.4"
+diff --git a/src-tui/src/bin/livencrypt-boot-shield.rs b/src-tui/src/bin/livencrypt-boot-shield.rs
+new file mode 100644
+index 0000000..e4b7d79
+--- /dev/null
++++ b/src-tui/src/bin/livencrypt-boot-shield.rs
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
++/* rol: utilidad CLI de verificación pre-arranque para ganchos de initramfs */
++
++use livencrypt_lib::security::boot_shield::{self, BootKey};
++use std::process::ExitCode;
++
++fn usage() -> ExitCode {
++    eprintln!("uso: livencrypt-boot-shield <seal|unseal|verify> <clave-hex-32B> <entrada> [salida]");
++    ExitCode::from(2)
++}
++
++fn main() -> ExitCode {
++    let args: Vec<String> = std::env::args().collect();
++    if args.len() < 4 {
++        return usage();
++    }
++
++    let command = args[1].as_str();
++    let key = match BootKey::from_hex(&args[2]) {
++        Ok(key) => key,
++        Err(error) => {
++            eprintln!("error: {}", error);
++            return ExitCode::FAILURE;
++        }
++    };
++    let input = match std::fs::read(&args[3]) {
++        Ok(bytes) => bytes,
++        Err(error) => {
++            eprintln!("error leyendo {}: {}", args[3], error);
++            return ExitCode::FAILURE;
++        }
++    };
++
++    match command {
++        "seal" => write_result(boot_shield::seal_config(&key, &input), args.get(4)),
++        "unseal" => write_result(boot_shield::open_config(&key, &input), args.get(4)),
++        "verify" => {
++            if boot_shield::verify_config(&key, &input) {
++                println!("ok");
++                ExitCode::SUCCESS
++            } else {
++                eprintln!("verificacion fallida");
++                ExitCode::FAILURE
++            }
++        }
++        _ => usage(),
++    }
++}
++
++fn write_result(result: Result<Vec<u8>, String>, output: Option<&String>) -> ExitCode {
++    let Some(output) = output else {
++        return usage();
++    };
++    match result {
++        Ok(bytes) => match std::fs::write(output, bytes) {
++            Ok(()) => ExitCode::SUCCESS,
++            Err(error) => {
++                eprintln!("error escribiendo {}: {}", output, error);
++                ExitCode::FAILURE
++            }
++        },
++        Err(error) => {
++            eprintln!("error: {}", error);
++            ExitCode::FAILURE
++        }
++    }
++}
+diff --git a/src-tui/src/crypto/blockchain/firewall.rs b/src-tui/src/crypto/blockchain/firewall.rs
+index dfc6c4a..ac2bc49 100644
+--- a/src-tui/src/crypto/blockchain/firewall.rs
++++ b/src-tui/src/crypto/blockchain/firewall.rs
+@@ -7,7 +7,7 @@ use crate::crypto::blockchain::types::{ChainType, TxMethod};
+ use rust_decimal::Decimal;
+ use serde::{Deserialize, Serialize};
+ use std::collections::HashMap;
+-use std::time::{SystemTime, UNIX_EPOCH};
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ #[derive(Serialize, Deserialize, Clone, Debug)]
+ pub struct FirewallRules {
+@@ -41,6 +41,7 @@ pub struct LiveFirewall {
+     pub tx_count_today: u32,
+     pub volume_today_units: Decimal,
+     pub last_reset_timestamp: u64,
++    reset_instant: Instant,
+ }
+ 
+ impl Default for LiveFirewall {
+@@ -51,21 +52,23 @@ impl Default for LiveFirewall {
+ 
+ impl LiveFirewall {
+     pub fn new(rules: FirewallRules) -> Self {
+-        let now = now_unix();
+         Self {
+             rules,
+             tx_count_today: 0,
+             volume_today_units: Decimal::ZERO,
+-            last_reset_timestamp: now,
++            last_reset_timestamp: now_unix(),
++            reset_instant: Instant::now(),
+         }
+     }
+ 
+     fn check_and_reset_daily_counters(&mut self) {
+-        let now = now_unix();
+-        if now.saturating_sub(self.last_reset_timestamp) >= 86_400 {
++        // El reinicio diario se mide con un reloj monotónico, inmune a retrocesos
++        // del reloj de pared que un atacante local podría usar para refrescar cuotas.
++        if self.reset_instant.elapsed() >= Duration::from_secs(86_400) {
+             self.tx_count_today = 0;
+             self.volume_today_units = Decimal::ZERO;
+-            self.last_reset_timestamp = now;
++            self.reset_instant = Instant::now();
++            self.last_reset_timestamp = now_unix();
+         }
+     }
+ 
+@@ -151,6 +154,53 @@ impl LiveFirewall {
+         Ok(())
+     }
+ 
++    /// Gobernanza de destino inmutable: toda firma debe declarar un `target_dex_cex_id`
++    /// que coincida con un destino real de la transacción y esté en lista blanca.
++    pub fn validate_target_destination_id(
++        &self,
++        parsed: &ParsedTx,
++        target_id: Option<&str>,
++    ) -> Result<(), String> {
++        let target = target_id
++            .map(str::trim)
++            .filter(|value| !value.is_empty())
++            .ok_or_else(|| {
++                "destino inmutable obligatorio ausente: se requiere target_dex_cex_id".to_string()
++            })?;
++
++        let matches_real_destination = parsed.destinations.iter().any(|destination| {
++            matches!(
++                destination.kind,
++                ParsedDestinationKind::Native | ParsedDestinationKind::Erc20Receiver
++            ) && destination.address == target
++        });
++        if !matches_real_destination {
++            return Err(format!(
++                "violacion de destino inmutable: target_dex_cex_id '{}' no coincide con el destino real de la transaccion",
++                target
++            ));
++        }
++
++        let whitelisted = self
++            .rules
++            .allowed_dex_contracts
++            .iter()
++            .any(|contract| contract == target)
++            || self
++                .rules
++                .allowed_cex_destinations
++                .iter()
++                .any(|destination| destination == target);
++        if !whitelisted {
++            return Err(format!(
++                "violacion de destino inmutable: '{}' no esta en la lista blanca de DEX/CEX",
++                target
++            ));
++        }
++
++        Ok(())
++    }
++
+     pub fn commit_transaction(&mut self, estimated_volume_units: Decimal) -> Result<(), String> {
+         let projected = safe_volume_add(self.volume_today_units, estimated_volume_units)?;
+         if projected > self.rules.max_daily_volume_units {
+diff --git a/src-tui/src/crypto/blockchain/multi_curve.rs b/src-tui/src/crypto/blockchain/multi_curve.rs
+index 4944f7c..56c2cc9 100644
+--- a/src-tui/src/crypto/blockchain/multi_curve.rs
++++ b/src-tui/src/crypto/blockchain/multi_curve.rs
+@@ -59,21 +59,22 @@ impl UniversalKeymaster {
+         account: u32,
+         index: u32,
+     ) -> Result<[u8; 32], String> {
+-        for candidate_index in index..index.saturating_add(32) {
+-            let path = [
+-                hardened(44),
+-                hardened(coin_type),
+-                hardened(account),
+-                0,
+-                candidate_index,
+-            ];
+-            if let Ok(mut key) = derive_bip32_secp_path(&self.master_seed, &path) {
+-                let out = key;
+-                key.zeroize();
+-                return Ok(out);
+-            }
+-        }
+-        Err("No se pudo derivar clave secp256k1 valida en ventana BIP32".into())
++        let path = [
++            hardened(44),
++            hardened(coin_type),
++            hardened(account),
++            0,
++            index,
++        ];
++        let mut key = derive_bip32_secp_path(&self.master_seed, &path).map_err(|error| {
++            format!(
++                "clave secp256k1 invalida en el indice {} solicitado: {}",
++                index, error
++            )
++        })?;
++        let out = key;
++        key.zeroize();
++        Ok(out)
+     }
+ 
+     fn derive_slip10_ed25519_child(&self, account: u32, index: u32) -> Result<[u8; 32], String> {
+@@ -175,6 +176,7 @@ impl UniversalKeymaster {
+                 }
+                 ChainType::Solana => {
+                     let sk = SigningKey::from_bytes(&raw_key);
++                    // El payload ya es el mensaje Solana serializado; ed25519 firma esos bytes.
+                     let sig = sk.sign(raw_payload);
+ 
+                     Ok(SignatureResponse {
+diff --git a/src-tui/src/crypto/blockchain/supervisor.rs b/src-tui/src/crypto/blockchain/supervisor.rs
+index 32d3fdf..35f0ee0 100644
+--- a/src-tui/src/crypto/blockchain/supervisor.rs
++++ b/src-tui/src/crypto/blockchain/supervisor.rs
+@@ -31,6 +31,14 @@ impl GatewaySupervisor {
+     }
+ 
+     pub fn run_loop_iteration(&mut self, request: ExtensionRequest) -> Result<Vec<u8>, String> {
++        // Monitor de riesgo del entorno: un score crítico (binario manipulado,
++        // LD_PRELOAD, etc.) dispara el aislamiento permanente del llavero.
++        if crate::security::ai_monitor::current_risk_score()
++            >= crate::security::ai_monitor::CRITICAL_RISK_THRESHOLD
++        {
++            self.breaker.trigger_hard_lock();
++        }
++
+         if self.breaker.state == GatewaySecurityState::HardLocked {
+             let response = ExtensionResponse::<()>::Error(
+                 "acceso revocado: intervencion local requerida".to_string(),
+@@ -83,6 +91,18 @@ impl GatewaySupervisor {
+                     ));
+                     return serde_json::to_vec(&response).map_err(|error| error.to_string());
+                 }
++
++                if let Err(target_error) = self.firewall.validate_target_destination_id(
++                    &parsed,
++                    sign_request.target_dex_cex_id.as_deref(),
++                ) {
++                    self.register_integrity_failure(&target_error, now);
++                    let response = ExtensionResponse::<()>::Error(format!(
++                        "violacion de perimetro: {}",
++                        target_error
++                    ));
++                    return serde_json::to_vec(&response).map_err(|error| error.to_string());
++                }
+                 let effective_volume = match self.firewall.effective_volume_units(&parsed) {
+                     Ok(volume) => volume,
+                     Err(error) => {
+@@ -93,12 +113,34 @@ impl GatewaySupervisor {
+                 };
+ 
+                 // Firmar primero para no desperdiciar contadores si la firma falla.
+-                let signature_response = match self.keymaster.sign_transaction(
+-                    &sign_request.chain,
+-                    sign_request.account_index,
+-                    sign_request.address_index,
+-                    &sign_request.raw_tx_payload,
+-                ) {
++                // Si el sandbox de firma está activo, la clave solo se usa dentro de un
++                // proceso hijo aislado por namespaces (sin red), y solo regresa la firma.
++                let signature_result = if crate::security::sign_sandbox::sign_sandbox_requested() {
++                    let keymaster = &self.keymaster;
++                    let chain = sign_request.chain.clone();
++                    let account = sign_request.account_index;
++                    let index = sign_request.address_index;
++                    let payload = sign_request.raw_tx_payload.clone();
++                    crate::security::sign_sandbox::run_isolated(move || {
++                        let signature =
++                            keymaster.sign_transaction(&chain, account, index, &payload)?;
++                        serde_json::to_vec(&signature).map_err(|error| error.to_string())
++                    })
++                    .and_then(|bytes| {
++                        serde_json::from_slice::<crate::crypto::blockchain::types::SignatureResponse>(
++                            &bytes,
++                        )
++                        .map_err(|error| error.to_string())
++                    })
++                } else {
++                    self.keymaster.sign_transaction(
++                        &sign_request.chain,
++                        sign_request.account_index,
++                        sign_request.address_index,
++                        &sign_request.raw_tx_payload,
++                    )
++                };
++                let signature_response = match signature_result {
+                     Ok(signature) => signature,
+                     Err(error) => {
+                         let response = ExtensionResponse::<()>::Error(error);
+diff --git a/src-tui/src/crypto/blockchain/tx_parser.rs b/src-tui/src/crypto/blockchain/tx_parser.rs
+index 40b3de2..f9a6860 100644
+--- a/src-tui/src/crypto/blockchain/tx_parser.rs
++++ b/src-tui/src/crypto/blockchain/tx_parser.rs
+@@ -4,7 +4,6 @@
+ 
+ use crate::crypto::blockchain::types::{ChainType, TxMethod};
+ use rust_decimal::Decimal;
+-use serde::Deserialize;
+ 
+ #[derive(Clone, Debug, PartialEq)]
+ pub enum ParsedDestinationKind {
+@@ -38,7 +37,7 @@ pub fn parse_tx_payload(chain: &ChainType, raw_tx_payload: &[u8]) -> Result<Pars
+     match chain {
+         ChainType::Ethereum => parse_ethereum_payload(raw_tx_payload),
+         ChainType::Bitcoin => parse_bitcoin_payload(raw_tx_payload),
+-        ChainType::Solana => parse_solana_gateway_payload(raw_tx_payload),
++        ChainType::Solana => parse_solana_payload(raw_tx_payload),
+         ChainType::Monero => Err("Monero requiere parser forense especifico no integrado".into()),
+     }
+ }
+@@ -237,44 +236,102 @@ fn parse_bitcoin_payload(raw: &[u8]) -> Result<ParsedTx, String> {
+     })
+ }
+ 
+-fn parse_solana_gateway_payload(raw: &[u8]) -> Result<ParsedTx, String> {
+-    #[derive(Deserialize)]
+-    struct SolanaPayload {
+-        to_address: String,
+-        lamports: u64,
+-        method: Option<String>,
++fn parse_solana_payload(raw: &[u8]) -> Result<ParsedTx, String> {
++    // Decodifica un mensaje de transaccion Solana serializado (legacy o v0) y extrae
++    // una unica instruccion de transferencia nativa del System Program. Los bytes del
++    // mensaje son exactamente los que firma ed25519, igual que el binario en BTC/ETH.
++    const SYSTEM_TRANSFER_DISCRIMINANT: [u8; 4] = [2, 0, 0, 0];
++    const SOLANA_LAMPORTS_LIMIT: u64 = 100_000_000_000_000;
++
++    let first = *raw.first().ok_or_else(|| "mensaje Solana vacio".to_string())?;
++    let mut reader = ByteReader::new(raw);
++
++    if first & 0x80 != 0 {
++        let version = first & 0x7f;
++        if version != 0 {
++            return Err(format!(
++                "version de mensaje Solana no soportada: {}",
++                version
++            ));
++        }
++        reader.take(1)?;
++    }
++
++    reader.take(3)?; // cabecera: firmas requeridas y cuentas de solo lectura
++
++    let account_count = reader.read_compact_u16()? as usize;
++    if account_count == 0 || account_count > 256 {
++        return Err("numero de cuentas Solana invalido".into());
++    }
++    let mut accounts = Vec::with_capacity(account_count);
++    for _ in 0..account_count {
++        let mut key = [0u8; 32];
++        key.copy_from_slice(reader.take(32)?);
++        accounts.push(key);
++    }
++
++    reader.take(32)?; // blockhash reciente
++
++    let instruction_count = reader.read_compact_u16()? as usize;
++    if instruction_count == 0 || instruction_count > 64 {
++        return Err("numero de instrucciones Solana invalido".into());
+     }
+ 
+-    let payload: SolanaPayload = serde_json::from_slice(raw)
+-        .map_err(|error| format!("payload Solana no es JSON de pasarela: {}", error))?;
+-    if payload.to_address.trim().is_empty() {
+-        return Err("Solana sin destino".into());
++    let system_program = [0u8; 32];
++    let mut transfer: Option<(usize, u64)> = None;
++    for _ in 0..instruction_count {
++        let program_id_index = reader.take(1)?[0] as usize;
++        let account_index_count = reader.read_compact_u16()? as u64;
++        let account_indexes = reader.take_usize(account_index_count)?.to_vec();
++        let data_len = reader.read_compact_u16()? as u64;
++        let data = reader.take_usize(data_len)?;
++
++        let program_id = accounts
++            .get(program_id_index)
++            .ok_or_else(|| "indice de programa Solana fuera de rango".to_string())?;
++        if *program_id != system_program {
++            return Err(
++                "instruccion Solana no soportada: solo transferencias del System Program".into(),
++            );
++        }
++        if data.len() != 12 || data[0..4] != SYSTEM_TRANSFER_DISCRIMINANT {
++            return Err("instruccion System Program no soportada (solo Transfer)".into());
++        }
++        if account_indexes.len() != 2 {
++            return Err("transferencia Solana debe referenciar exactamente 2 cuentas".into());
++        }
++        if transfer.is_some() {
++            return Err("solo se admite una transferencia Solana por mensaje".into());
++        }
++        let mut lamports_bytes = [0u8; 8];
++        lamports_bytes.copy_from_slice(&data[4..12]);
++        transfer = Some((account_indexes[1] as usize, u64::from_le_bytes(lamports_bytes)));
+     }
+-    if payload.lamports > 100_000_000_000_000u64 {
++
++    let (to_index, lamports) =
++        transfer.ok_or_else(|| "mensaje Solana sin transferencia".to_string())?;
++    if lamports > SOLANA_LAMPORTS_LIMIT {
+         return Err("Solana lamports excesivos (limite 10^14)".into());
+     }
+-    let method_str = payload.method.as_deref().unwrap_or("transfer");
+-    let method = if method_str == "transfer" {
+-        TxMethod::SolanaTransfer
+-    } else {
+-        TxMethod::Unsupported(method_str.to_string())
+-    };
+-    let summary = format!(
+-        "Solana destino={} lamports={} metodo={}",
+-        payload.to_address, payload.lamports, method_str
+-    );
++    let recipient = accounts
++        .get(to_index)
++        .ok_or_else(|| "indice de destinatario Solana fuera de rango".to_string())?;
++    let to_address = bs58::encode(recipient.as_slice()).into_string();
++    let value_units = lamports as u128;
++    let summary = format!("solana_transfer to={} lamports={}", to_address, lamports);
++
+     Ok(ParsedTx {
+         chain: ChainType::Solana,
+-        to_address: payload.to_address.clone(),
+-        value_units: payload.lamports as u128,
+-        volume_units: native_units(ChainType::Solana, payload.lamports as u128),
++        to_address: to_address.clone(),
++        value_units,
++        volume_units: native_units(ChainType::Solana, value_units),
+         destinations: vec![ParsedDestination {
+-            address: payload.to_address,
+-            value_units: payload.lamports as u128,
++            address: to_address,
++            value_units,
+             kind: ParsedDestinationKind::Native,
+         }],
+         chain_id: 501,
+-        method,
++        method: TxMethod::SolanaTransfer,
+         summary,
+     })
+ }
+@@ -450,6 +507,23 @@ impl<'a> ByteReader<'a> {
+         Ok(u64::from_le_bytes(array))
+     }
+ 
++    fn read_compact_u16(&mut self) -> Result<u16, String> {
++        let mut value: u32 = 0;
++        let mut shift: u32 = 0;
++        loop {
++            let byte = self.take(1)?[0];
++            value |= ((byte & 0x7f) as u32) << shift;
++            if byte & 0x80 == 0 {
++                break;
++            }
++            shift += 7;
++            if shift > 14 {
++                return Err("compact-u16 Solana invalido".into());
++            }
++        }
++        u16::try_from(value).map_err(|_| "compact-u16 Solana fuera de rango".to_string())
++    }
++
+     fn read_varint(&mut self) -> Result<u64, String> {
+         let tag = self.take(1)?[0];
+         match tag {
+@@ -568,36 +642,48 @@ mod tests {
+         assert!(matches!(parsed.method, TxMethod::BtcRawTx));
+     }
+ 
++    fn solana_transfer_message(to: [u8; 32], lamports: u64) -> Vec<u8> {
++        let mut message = Vec::new();
++        message.extend_from_slice(&[1, 0, 1]); // cabecera del mensaje
++        message.push(3); // tres cuentas: emisor, destino, System Program
++        message.extend_from_slice(&[0x01; 32]); // emisor
++        message.extend_from_slice(&to); // destino
++        message.extend_from_slice(&[0x00; 32]); // System Program (todo ceros)
++        message.extend_from_slice(&[0x09; 32]); // blockhash reciente
++        message.push(1); // una instruccion
++        message.push(2); // program_id_index -> System Program
++        message.extend_from_slice(&[2, 0, 1]); // dos cuentas: emisor(0), destino(1)
++        message.push(12); // longitud de los datos
++        message.extend_from_slice(&[2, 0, 0, 0]); // discriminante Transfer
++        message.extend_from_slice(&lamports.to_le_bytes());
++        message
++    }
++
+     #[test]
+-    fn solana_transfer_uses_solana_transfer_method() {
+-        let payload = serde_json::json!({
+-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
+-            "lamports": 1_000_000,
+-            "method": "transfer"
+-        });
+-        let parsed = parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).unwrap();
++    fn solana_parses_system_transfer() {
++        let to = [0x2a; 32];
++        let message = solana_transfer_message(to, 1_000_000);
++        let parsed = parse_tx_payload(&ChainType::Solana, &message).unwrap();
+         assert!(matches!(parsed.method, TxMethod::SolanaTransfer));
++        assert_eq!(parsed.value_units, 1_000_000);
++        assert_eq!(parsed.to_address, bs58::encode(to).into_string());
++        assert_eq!(parsed.destinations.len(), 1);
++        assert_eq!(parsed.chain_id, 501);
+     }
+ 
+     #[test]
+-    fn solana_non_transfer_method_becomes_unsupported() {
+-        let payload = serde_json::json!({
+-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
+-            "lamports": 1_000_000,
+-            "method": "swap"
+-        });
+-        let parsed = parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).unwrap();
+-        assert!(matches!(parsed.method, TxMethod::Unsupported(ref m) if m == "swap"));
++    fn solana_rejects_non_system_instruction() {
++        let mut message = solana_transfer_message([0x2a; 32], 1_000_000);
++        // Corrompe la cuenta del System Program (offset cabecera+len+emisor+destino).
++        let system_offset = 3 + 1 + 32 + 32;
++        message[system_offset] = 0xff;
++        assert!(parse_tx_payload(&ChainType::Solana, &message).is_err());
+     }
+ 
+     #[test]
+     fn solana_rejects_lamports_above_limit() {
+-        let payload = serde_json::json!({
+-            "to_address": "AbcDefGhiJkLmNoPqRsTuVwXyZ1234567890AbCdEf",
+-            "lamports": 100_000_000_000_001u64,
+-            "method": "transfer"
+-        });
+-        assert!(parse_tx_payload(&ChainType::Solana, payload.to_string().as_bytes()).is_err());
++        let message = solana_transfer_message([0x2a; 32], 100_000_000_000_001);
++        assert!(parse_tx_payload(&ChainType::Solana, &message).is_err());
+     }
+ 
+     #[test]
+diff --git a/src-tui/src/crypto/blockchain/worker.rs b/src-tui/src/crypto/blockchain/worker.rs
+index 9eb29ce..511765b 100644
+--- a/src-tui/src/crypto/blockchain/worker.rs
++++ b/src-tui/src/crypto/blockchain/worker.rs
+@@ -146,11 +146,26 @@ fn spawn_socket_reader(
+                 continue;
+             }
+ 
+-            if active_connections.load(Ordering::Relaxed) >= MAX_CONCURRENT_CONNECTIONS {
++            // Reserva de slot atómica: comparar-e-intercambiar evita que ráfagas
++            // concurrentes superen el límite por una condición de carrera load/add.
++            let mut current = active_connections.load(Ordering::Acquire);
++            let reserved = loop {
++                if current >= MAX_CONCURRENT_CONNECTIONS {
++                    break false;
++                }
++                match active_connections.compare_exchange_weak(
++                    current,
++                    current + 1,
++                    Ordering::AcqRel,
++                    Ordering::Acquire,
++                ) {
++                    Ok(_) => break true,
++                    Err(observed) => current = observed,
++                }
++            };
++            if !reserved {
+                 continue;
+             }
+-
+-            active_connections.fetch_add(1, Ordering::Relaxed);
+             let thread_tx = cmd_tx.clone();
+             let counter = Arc::clone(&active_connections);
+ 
+@@ -162,7 +177,7 @@ fn spawn_socket_reader(
+                 if let Ok(payload) = read_native_message(&mut stream) {
+                     let _ = thread_tx.send(Web3WorkerCmd::IncomingWebRequest(payload, stream));
+                 }
+-                counter.fetch_sub(1, Ordering::Relaxed);
++                counter.fetch_sub(1, Ordering::Release);
+             });
+         }
+ 
+diff --git a/src-tui/src/crypto/mod.rs b/src-tui/src/crypto/mod.rs
+index 0c6fc09..08156c3 100644
+--- a/src-tui/src/crypto/mod.rs
++++ b/src-tui/src/crypto/mod.rs
+@@ -5,3 +5,4 @@
+ pub mod blockchain;
+ pub mod file_cipher;
+ pub mod positional;
++pub mod secure_text;
+diff --git a/src-tui/src/crypto/secure_text.rs b/src-tui/src/crypto/secure_text.rs
+new file mode 100644
+index 0000000..ef98358
+--- /dev/null
++++ b/src-tui/src/crypto/secure_text.rs
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
++/* rol: cifrado autenticado de texto con Argon2id y XChaCha20Poly1305 */
++
++use argon2::{Algorithm, Argon2, Params, Version};
++use chacha20poly1305::{
++    aead::{Aead, KeyInit, Payload},
++    Key, XChaCha20Poly1305, XNonce,
++};
++use rand::RngCore;
++use zeroize::Zeroize;
++
++const MAGIC: &[u8; 4] = b"LVCT";
++const SALT_LEN: usize = 32;
++const NONCE_LEN: usize = 24;
++const MIN_SECRET_CHARS: usize = 12;
++
++fn argon2id() -> Result<Argon2<'static>, String> {
++    let params = Params::new(131_072, 3, 1, Some(32))
++        .map_err(|error| format!("parametros Argon2id invalidos: {}", error))?;
++    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
++}
++
++fn derive_key(secret: &str, salt: &[u8]) -> Result<[u8; 32], String> {
++    if secret.trim().chars().count() < MIN_SECRET_CHARS {
++        return Err(format!(
++            "la clave de texto debe tener al menos {} caracteres",
++            MIN_SECRET_CHARS
++        ));
++    }
++    let mut key = [0u8; 32];
++    argon2id()?
++        .hash_password_into(secret.as_bytes(), salt, &mut key)
++        .map_err(|error| format!("no se pudo derivar la clave de texto: {}", error))?;
++    Ok(key)
++}
++
++pub fn encrypt_text(plaintext: &str, secret: &str) -> Result<String, String> {
++    let mut salt = [0u8; SALT_LEN];
++    rand::rngs::OsRng.fill_bytes(&mut salt);
++    let mut nonce = [0u8; NONCE_LEN];
++    rand::rngs::OsRng.fill_bytes(&mut nonce);
++
++    let mut header = Vec::with_capacity(MAGIC.len() + SALT_LEN + NONCE_LEN);
++    header.extend_from_slice(MAGIC);
++    header.extend_from_slice(&salt);
++    header.extend_from_slice(&nonce);
++
++    let mut key = derive_key(secret, &salt)?;
++    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
++    let ciphertext = cipher.encrypt(
++        XNonce::from_slice(&nonce),
++        Payload {
++            msg: plaintext.as_bytes(),
++            aad: &header,
++        },
++    );
++    key.zeroize();
++    let ciphertext = ciphertext.map_err(|_| "fallo AEAD al cifrar texto".to_string())?;
++
++    let mut envelope = header;
++    envelope.extend_from_slice(&ciphertext);
++    Ok(hex::encode(envelope))
++}
++
++pub fn decrypt_text(token: &str, secret: &str) -> Result<String, String> {
++    let raw = hex::decode(token.trim())
++        .map_err(|_| "texto cifrado Livencrypt invalido (no es hexadecimal)".to_string())?;
++    let header_len = MAGIC.len() + SALT_LEN + NONCE_LEN;
++    if raw.len() <= header_len || &raw[..MAGIC.len()] != MAGIC {
++        return Err("texto cifrado Livencrypt no reconocido".to_string());
++    }
++    let salt = &raw[MAGIC.len()..MAGIC.len() + SALT_LEN];
++    let nonce = &raw[MAGIC.len() + SALT_LEN..header_len];
++    let ciphertext = &raw[header_len..];
++
++    let mut key = derive_key(secret, salt)?;
++    let cipher = XChaCha20Poly1305::new(Key::from_slice(&key));
++    let plaintext = cipher.decrypt(
++        XNonce::from_slice(nonce),
++        Payload {
++            msg: ciphertext,
++            aad: &raw[..header_len],
++        },
++    );
++    key.zeroize();
++    let plaintext = plaintext
++        .map_err(|_| "autenticacion AEAD fallida: texto manipulado o clave incorrecta".to_string())?;
++
++    String::from_utf8(plaintext).map_err(|_| "el texto descifrado no es UTF-8 valido".to_string())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn secure_text_roundtrip() {
++        let secret = "clave de texto segura 2026";
++        let token = encrypt_text("mensaje confidencial", secret).expect("cifrar");
++        assert_eq!(decrypt_text(&token, secret).expect("descifrar"), "mensaje confidencial");
++    }
++
++    #[test]
++    fn secure_text_wrong_secret_fails() {
++        let token = encrypt_text("mensaje", "clave correcta 2026").expect("cifrar");
++        assert!(decrypt_text(&token, "clave erronea 2026xx").is_err());
++    }
++
++    #[test]
++    fn secure_text_is_not_deterministic() {
++        let secret = "clave de texto segura 2026";
++        let a = encrypt_text("mismo mensaje", secret).unwrap();
++        let b = encrypt_text("mismo mensaje", secret).unwrap();
++        assert_ne!(a, b);
++    }
++
++    #[test]
++    fn secure_text_rejects_short_secret() {
++        assert!(encrypt_text("mensaje", "corta").is_err());
++    }
++}
+diff --git a/src-tui/src/lib.rs b/src-tui/src/lib.rs
+index 9e8a175..f0d9ea4 100644
+--- a/src-tui/src/lib.rs
++++ b/src-tui/src/lib.rs
+@@ -39,6 +39,12 @@ pub fn initialize_core() {
+         eprintln!("[SECURITY] {}", warning);
+     }
+ 
++    if crate::security::seccomp::seccomp_requested() {
++        if let Err(error) = crate::security::seccomp::apply_syscall_denylist() {
++            eprintln!("[SECURITY] seccomp no aplicado: {}", error);
++        }
++    }
++
+     crate::crypto::file_cipher::configure_chunk_tasks();
+     if let Err(error) = crate::templates::initialize_defaults() {
+         eprintln!("[INIT] Error inicializando plantillas: {}", error);
+@@ -131,6 +137,14 @@ pub fn decipher_text(
+     ))
+ }
+ 
++pub fn cipher_text_secure(plaintext: &str, secret: &str) -> Result<String, String> {
++    crate::crypto::secure_text::encrypt_text(plaintext, secret)
++}
++
++pub fn decipher_text_secure(token: &str, secret: &str) -> Result<String, String> {
++    crate::crypto::secure_text::decrypt_text(token, secret)
++}
++
+ pub fn load_file_info(path: &Path) -> Result<FileInfo, String> {
+     FileCipher::load_file_info(path)
+ }
+diff --git a/src-tui/src/security/ai_monitor.rs b/src-tui/src/security/ai_monitor.rs
+index d5464d4..22cc18c 100644
+--- a/src-tui/src/security/ai_monitor.rs
++++ b/src-tui/src/security/ai_monitor.rs
+@@ -2,6 +2,9 @@
+ // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
+ /* rol: Sistema reactivo de detección de intrusiones mediante análisis de actividad local */
+ 
++/// Umbral de riesgo a partir del cual el disyuntor táctico debe pasar a HardLocked.
++pub const CRITICAL_RISK_THRESHOLD: f32 = 0.5;
++
+ pub fn heuristic_risk_score(syscalls: &[u32]) -> f32 {
+     let socket_like = syscalls
+         .iter()
+@@ -19,6 +22,34 @@ pub fn heuristic_risk_score(syscalls: &[u32]) -> f32 {
+     score.min(1.0)
+ }
+ 
++/// Puntuación de riesgo del entorno de ejecución real, derivada del estado de
++/// endurecimiento del proceso (inyección de librerías, integridad del binario,
++/// volcados de memoria y bloqueo en RAM). Alimenta al disyuntor táctico.
++pub fn current_risk_score() -> f32 {
++    let Some(status) = crate::security::process_hardening::hardening_status_peek() else {
++        return 0.0;
++    };
++    let mut score = 0.0f32;
++
++    if status.binary_integrity_ok == Some(false) {
++        score += 0.6;
++    }
++    if status.ld_preload_present {
++        score += 0.4;
++    }
++    if status.running_as_root {
++        score += 0.2;
++    }
++    if !status.dumpable_disabled {
++        score += 0.1;
++    }
++    if !status.mlockall_applied {
++        score += 0.1;
++    }
++
++    score.min(1.0)
++}
++
+ pub fn expu_baseline_risk() -> f32 {
+     heuristic_risk_score(&[])
+ }
+diff --git a/src-tui/src/security/boot_shield.rs b/src-tui/src/security/boot_shield.rs
+new file mode 100644
+index 0000000..8bc74e3
+--- /dev/null
++++ b/src-tui/src/security/boot_shield.rs
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
++/* rol: verificación pre-arranque y sellado ChaCha20Poly1305 de la configuración de initramfs */
++
++use chacha20poly1305::{
++    aead::{Aead, KeyInit, Payload},
++    ChaCha20Poly1305, Key, Nonce,
++};
++use rand::RngCore;
++use sha2::{Digest, Sha256};
++use zeroize::Zeroize;
++
++const MAGIC: &[u8; 8] = b"LVCBOOT1";
++const NONCE_LEN: usize = 12;
++
++pub struct BootKey {
++    key: [u8; 32],
++}
++
++impl Drop for BootKey {
++    fn drop(&mut self) {
++        self.key.zeroize();
++    }
++}
++
++impl BootKey {
++    pub fn from_hex(hex_key: &str) -> Result<Self, String> {
++        let raw = hex::decode(hex_key.trim())
++            .map_err(|_| "clave de Boot Shield invalida (hexadecimal)".to_string())?;
++        if raw.len() != 32 {
++            return Err("la clave de Boot Shield debe ser de 32 bytes (64 hex)".into());
++        }
++        let mut key = [0u8; 32];
++        key.copy_from_slice(&raw);
++        Ok(Self { key })
++    }
++
++    pub fn from_passphrase(passphrase: &str) -> Self {
++        let mut hasher = Sha256::new();
++        hasher.update(b"LIVENCRYPT-BOOT-SHIELD-KDF-V1");
++        hasher.update(passphrase.as_bytes());
++        let mut key = [0u8; 32];
++        key.copy_from_slice(&hasher.finalize());
++        Self { key }
++    }
++}
++
++pub fn seal_config(key: &BootKey, plaintext: &[u8]) -> Result<Vec<u8>, String> {
++    let mut nonce = [0u8; NONCE_LEN];
++    rand::rngs::OsRng.fill_bytes(&mut nonce);
++    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.key));
++    let ciphertext = cipher
++        .encrypt(
++            Nonce::from_slice(&nonce),
++            Payload {
++                msg: plaintext,
++                aad: MAGIC,
++            },
++        )
++        .map_err(|_| "fallo ChaCha20Poly1305 al sellar la configuracion de arranque".to_string())?;
++
++    let mut out = Vec::with_capacity(MAGIC.len() + NONCE_LEN + ciphertext.len());
++    out.extend_from_slice(MAGIC);
++    out.extend_from_slice(&nonce);
++    out.extend_from_slice(&ciphertext);
++    Ok(out)
++}
++
++pub fn open_config(key: &BootKey, sealed: &[u8]) -> Result<Vec<u8>, String> {
++    let header = MAGIC.len() + NONCE_LEN;
++    if sealed.len() <= header || &sealed[..MAGIC.len()] != MAGIC {
++        return Err("contenedor de arranque no reconocido".into());
++    }
++    let nonce = &sealed[MAGIC.len()..header];
++    let ciphertext = &sealed[header..];
++    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key.key));
++    cipher
++        .decrypt(
++            Nonce::from_slice(nonce),
++            Payload {
++                msg: ciphertext,
++                aad: MAGIC,
++            },
++        )
++        .map_err(|_| {
++            "verificacion de arranque fallida: configuracion manipulada o clave incorrecta"
++                .to_string()
++        })
++}
++
++pub fn verify_config(key: &BootKey, sealed: &[u8]) -> bool {
++    open_config(key, sealed).is_ok()
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn boot_shield_seal_open_roundtrip() {
++        let key = BootKey::from_passphrase("frase de arranque del sistema");
++        let sealed = seal_config(&key, b"configuracion critica").expect("sellar");
++        assert_eq!(open_config(&key, &sealed).expect("abrir"), b"configuracion critica");
++        assert!(verify_config(&key, &sealed));
++    }
++
++    #[test]
++    fn boot_shield_rejects_tampered_container() {
++        let key = BootKey::from_passphrase("frase de arranque del sistema");
++        let mut sealed = seal_config(&key, b"configuracion critica").expect("sellar");
++        let last = sealed.len() - 1;
++        sealed[last] ^= 0x55;
++        assert!(!verify_config(&key, &sealed));
++    }
++
++    #[test]
++    fn boot_shield_rejects_wrong_key() {
++        let key = BootKey::from_passphrase("frase correcta");
++        let sealed = seal_config(&key, b"config").expect("sellar");
++        let other = BootKey::from_passphrase("frase incorrecta");
++        assert!(!verify_config(&other, &sealed));
++    }
++}
+diff --git a/src-tui/src/security/mod.rs b/src-tui/src/security/mod.rs
+index fcc1309..f666cc8 100644
+--- a/src-tui/src/security/mod.rs
++++ b/src-tui/src/security/mod.rs
+@@ -5,6 +5,7 @@
+ pub mod ai_monitor;
+ pub mod apparmor;
+ pub mod audit;
++pub mod boot_shield;
+ pub mod forensics;
+ pub mod install_profile;
+ pub mod loader;
+@@ -12,6 +13,8 @@ pub mod network_profile;
+ pub mod process_hardening;
+ pub mod recovery;
+ pub mod sandbox;
++pub mod seccomp;
++pub mod sign_sandbox;
+ pub mod updates;
+ pub mod vault;
+ 
+diff --git a/src-tui/src/security/process_hardening.rs b/src-tui/src/security/process_hardening.rs
+index 79074dd..8e31b93 100644
+--- a/src-tui/src/security/process_hardening.rs
++++ b/src-tui/src/security/process_hardening.rs
+@@ -210,6 +210,12 @@ pub fn process_hardening_status() -> ProcessHardeningStatus {
+     initialize_process_hardening()
+ }
+ 
++/// Devuelve el estado de endurecimiento solo si ya fue inicializado, sin aplicarlo.
++/// Permite consultar el riesgo sin provocar efectos colaterales (mlockall, prctl).
++pub fn hardening_status_peek() -> Option<ProcessHardeningStatus> {
++    HARDENING_STATUS.get().cloned()
++}
++
+ #[cfg(all(test, target_os = "linux"))]
+ mod tests {
+     use super::*;
+diff --git a/src-tui/src/security/seccomp.rs b/src-tui/src/security/seccomp.rs
+new file mode 100644
+index 0000000..19688a3
+--- /dev/null
++++ b/src-tui/src/security/seccomp.rs
+@@ -0,0 +1,81 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
++/* rol: filtro seccomp BPF de denegación de syscalls peligrosas */
++
++#[cfg(target_os = "linux")]
++use seccompiler::{apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch};
++#[cfg(target_os = "linux")]
++use std::collections::BTreeMap;
++
++pub const SECCOMP_ENV_FLAG: &str = "LIVENCRYPT_SECCOMP";
++
++pub fn seccomp_requested() -> bool {
++    std::env::var_os(SECCOMP_ENV_FLAG).is_some()
++}
++
++#[cfg(target_os = "linux")]
++fn target_arch() -> Result<TargetArch, String> {
++    if cfg!(target_arch = "x86_64") {
++        Ok(TargetArch::x86_64)
++    } else if cfg!(target_arch = "aarch64") {
++        Ok(TargetArch::aarch64)
++    } else {
++        Err("arquitectura no soportada por el filtro seccomp".to_string())
++    }
++}
++
++#[cfg(target_os = "linux")]
++fn denied_syscalls() -> Vec<libc::c_long> {
++    // Llamadas que comprometen memoria, depuracion o persistencia del nucleo.
++    vec![
++        libc::SYS_ptrace,
++        libc::SYS_process_vm_readv,
++        libc::SYS_process_vm_writev,
++        libc::SYS_kexec_load,
++        libc::SYS_kexec_file_load,
++        libc::SYS_init_module,
++        libc::SYS_finit_module,
++        libc::SYS_delete_module,
++        libc::SYS_iopl,
++        libc::SYS_ioperm,
++        libc::SYS_perf_event_open,
++        libc::SYS_personality,
++        libc::SYS_mount,
++        libc::SYS_umount2,
++        libc::SYS_pivot_root,
++        libc::SYS_setns,
++        libc::SYS_swapon,
++        libc::SYS_swapoff,
++    ]
++}
++
++/// Aplica una lista negra de syscalls peligrosas (acción por defecto permitir,
++/// matar el proceso si se invoca una de la lista). No es una lista blanca estricta
++/// para no bloquear el arranque de la TUI; el endurecimiento total se activa con
++/// la variable de entorno y puede afinarse a whitelist tras pruebas en destino.
++#[cfg(target_os = "linux")]
++pub fn apply_syscall_denylist() -> Result<(), String> {
++    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
++    for syscall in denied_syscalls() {
++        rules.insert(syscall as i64, Vec::new());
++    }
++
++    let filter = SeccompFilter::new(
++        rules,
++        SeccompAction::Allow,
++        SeccompAction::KillProcess,
++        target_arch()?,
++    )
++    .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
++
++    let program: BpfProgram = filter
++        .try_into()
++        .map_err(|error| format!("no se pudo compilar el filtro seccomp: {}", error))?;
++
++    apply_filter(&program).map_err(|error| format!("no se pudo aplicar el filtro seccomp: {}", error))
++}
++
++#[cfg(not(target_os = "linux"))]
++pub fn apply_syscall_denylist() -> Result<(), String> {
++    Err("seccomp solo esta disponible en Linux".to_string())
++}
+diff --git a/src-tui/src/security/sign_sandbox.rs b/src-tui/src/security/sign_sandbox.rs
+new file mode 100644
+index 0000000..09203ab
+--- /dev/null
++++ b/src-tui/src/security/sign_sandbox.rs
+@@ -0,0 +1,107 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
++/* rol: aislamiento por namespaces del momento de firma criptográfica */
++
++#![allow(unsafe_code)]
++
++pub const SIGN_SANDBOX_ENV_FLAG: &str = "LIVENCRYPT_SIGN_SANDBOX";
++
++pub fn sign_sandbox_requested() -> bool {
++    std::env::var_os(SIGN_SANDBOX_ENV_FLAG).is_some()
++}
++
++/// Ejecuta `producer` en un proceso hijo aislado por namespaces de Linux
++/// (red, montajes y PID) y devuelve sus bytes a través de un socketpair. El hijo
++/// queda sin pila de red para impedir la exfiltración de claves; si no logra
++/// aislarse, no firma (fail-closed). El padre conserva firewall y disyuntor.
++#[cfg(target_os = "linux")]
++pub fn run_isolated<F>(producer: F) -> Result<Vec<u8>, String>
++where
++    F: FnOnce() -> Result<Vec<u8>, String>,
++{
++    use std::io::{Read, Write};
++    use std::os::unix::io::{FromRawFd, RawFd};
++    use std::os::unix::net::UnixStream;
++
++    let mut fds = [0 as RawFd; 2];
++    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
++    if rc != 0 {
++        return Err("no se pudo crear el socketpair del sandbox de firma".into());
++    }
++    let parent_fd = fds[0];
++    let child_fd = fds[1];
++
++    let pid = unsafe { libc::fork() };
++    if pid < 0 {
++        unsafe {
++            libc::close(parent_fd);
++            libc::close(child_fd);
++        }
++        return Err("no se pudo bifurcar el proceso de firma".into());
++    }
++
++    if pid == 0 {
++        unsafe {
++            libc::close(parent_fd);
++        }
++        let isolated = isolate_child().is_ok();
++        let mut stream = unsafe { UnixStream::from_raw_fd(child_fd) };
++        let payload = if isolated {
++            producer().unwrap_or_default()
++        } else {
++            Vec::new()
++        };
++        let length = (payload.len() as u32).to_le_bytes();
++        let _ = stream.write_all(&length);
++        let _ = stream.write_all(&payload);
++        let _ = stream.flush();
++        unsafe { libc::_exit(0) };
++    }
++
++    unsafe {
++        libc::close(child_fd);
++    }
++    let mut stream = unsafe { UnixStream::from_raw_fd(parent_fd) };
++    let mut length_buffer = [0u8; 4];
++    let read_result = stream.read_exact(&mut length_buffer);
++
++    let outcome = (|| {
++        read_result.map_err(|_| "el firmante aislado no devolvio longitud".to_string())?;
++        let length = u32::from_le_bytes(length_buffer) as usize;
++        if length == 0 {
++            return Err("el firmante aislado no produjo firma (aislamiento no disponible)".to_string());
++        }
++        let mut payload = vec![0u8; length];
++        stream
++            .read_exact(&mut payload)
++            .map_err(|_| "el firmante aislado no devolvio la firma completa".to_string())?;
++        Ok(payload)
++    })();
++
++    let mut status: libc::c_int = 0;
++    unsafe {
++        libc::waitpid(pid, &mut status as *mut libc::c_int, 0);
++    }
++    outcome
++}
++
++#[cfg(target_os = "linux")]
++fn isolate_child() -> Result<(), String> {
++    unsafe {
++        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
++            return Err("no se pudo aplicar PR_SET_NO_NEW_PRIVS".into());
++        }
++        if libc::unshare(libc::CLONE_NEWNET | libc::CLONE_NEWNS | libc::CLONE_NEWPID) != 0 {
++            return Err("no se pudieron crear los namespaces de firma".into());
++        }
++    }
++    Ok(())
++}
++
++#[cfg(not(target_os = "linux"))]
++pub fn run_isolated<F>(_producer: F) -> Result<Vec<u8>, String>
++where
++    F: FnOnce() -> Result<Vec<u8>, String>,
++{
++    Err("el sandbox de firma por namespaces solo esta disponible en Linux".into())
++}
+diff --git a/src-tui/src/security/vault.rs b/src-tui/src/security/vault.rs
+index 1b23718..d3719c7 100644
+--- a/src-tui/src/security/vault.rs
++++ b/src-tui/src/security/vault.rs
+@@ -64,7 +64,7 @@ impl Default for KdfParams {
+     fn default() -> Self {
+         Self {
+             algorithm: KDF_ALGORITHM.to_string(),
+-            memory_kib: 65_536,
++            memory_kib: 131_072,
+             iterations: 3,
+             parallelism: 1,
+         }
+diff --git a/src-tui/tests/blockchain_gateway_tests.rs b/src-tui/tests/blockchain_gateway_tests.rs
+index ef7eb7f..01ddda4 100644
+--- a/src-tui/tests/blockchain_gateway_tests.rs
++++ b/src-tui/tests/blockchain_gateway_tests.rs
+@@ -46,7 +46,7 @@ fn sign_transaction_allowed_only_after_parsing_real_destination() {
+             address_index: 0,
+             raw_tx_payload: ethereum_legacy_payload(0x11),
+             value_usd: Decimal::from(999_999),
+-            target_dex_cex_id: Some("campo-externo-ignorado".to_string()),
++            target_dex_cex_id: Some(format!("0x{}", hex::encode([0x11; 20]))),
+         }))
+         .expect("response");
+ 

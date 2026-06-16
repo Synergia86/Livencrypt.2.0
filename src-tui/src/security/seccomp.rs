@@ -7,7 +7,7 @@ use seccompiler::{
     apply_filter, BpfProgram, SeccompAction, SeccompFilter, SeccompRule, TargetArch,
 };
 #[cfg(target_os = "linux")]
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 pub const SECCOMP_ENV_FLAG: &str = "LIVENCRYPT_SECCOMP";
 
@@ -53,18 +53,22 @@ fn denied_syscalls() -> Vec<libc::c_long> {
 /// la variable de entorno y puede afinarse a whitelist tras pruebas en destino.
 #[cfg(target_os = "linux")]
 pub fn apply_syscall_denylist() -> Result<(), String> {
-    let mut rules: HashMap<i32, Vec<SeccompRule>> = HashMap::new();
+    let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     for syscall in denied_syscalls() {
         rules.insert(syscall, Vec::new());
-        rules.insert(syscall as i32, Vec::new());
     }
 
     let target_arch: TargetArch = std::env::consts::ARCH
         .try_into()
         .map_err(|_| "arquitectura no soportada por el filtro seccomp".to_string())?;
 
-    let filter = SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Trap, target_arch)
-        .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
+    let filter = SeccompFilter::new(
+        rules,
+        SeccompAction::Allow,
+        SeccompAction::Trap,
+        target_arch,
+    )
+    .map_err(|error| format!("no se pudo construir el filtro seccomp: {}", error))?;
 
     let program: BpfProgram = filter
         .try_into()

@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: supervisor maestro y coordinador de la pasarela de custodia universal */
 
+use crate::crypto::blockchain::address;
 use crate::crypto::blockchain::breaker::{GatewaySecurityState, TacticalCircuitBreaker};
 use crate::crypto::blockchain::firewall::LiveFirewall;
 use crate::crypto::blockchain::multi_curve::UniversalKeymaster;
@@ -9,7 +10,9 @@ use crate::crypto::blockchain::proxy::{
     read_native_message, write_native_message, ExtensionRequest, ExtensionResponse,
 };
 use crate::crypto::blockchain::tx_parser::parse_tx_payload;
-use crate::crypto::blockchain::types::{SigningRequestPreview, TransactionSignRequest};
+use crate::crypto::blockchain::types::{
+    SigningRequestPreview, TransactionSignRequest, Web3AccountResponse, Web3StatusResponse,
+};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -53,6 +56,19 @@ impl GatewaySupervisor {
             .as_secs();
 
         match request {
+            ExtensionRequest::Web3Status => {
+                let response = ExtensionResponse::Success(Web3StatusResponse {
+                    unlocked: !matches!(self.breaker.state, GatewaySecurityState::Frozen { .. }),
+                    gateway_state: format!("{:?}", self.breaker.state),
+                    profile: "worker-required".to_string(),
+                    supported_chains: vec![
+                        "ethereum".to_string(),
+                        "bitcoin".to_string(),
+                        "solana".to_string(),
+                    ],
+                });
+                serde_json::to_vec(&response).map_err(|error| error.to_string())
+            }
             ExtensionRequest::DeriveKey(derivation) => {
                 if matches!(self.breaker.state, GatewaySecurityState::Frozen { .. }) {
                     let response = ExtensionResponse::<Vec<u8>>::Error(
@@ -63,12 +79,58 @@ impl GatewaySupervisor {
 
                 let response = match self.keymaster.get_public_key(
                     &derivation.chain,
+                    derivation.network,
                     derivation.account_index,
                     derivation.address_index,
                 ) {
                     Ok(public_key) => ExtensionResponse::Success(public_key),
                     Err(error) => ExtensionResponse::<Vec<u8>>::Error(error),
                 };
+                serde_json::to_vec(&response).map_err(|error| error.to_string())
+            }
+            ExtensionRequest::Web3Account(request) => {
+                if matches!(self.breaker.state, GatewaySecurityState::Frozen { .. }) {
+                    let response = ExtensionResponse::<Web3AccountResponse>::Error(
+                        "operacion suspendida temporalmente".to_string(),
+                    );
+                    return serde_json::to_vec(&response).map_err(|error| error.to_string());
+                }
+
+                let response = match self.keymaster.get_public_key(
+                    &request.chain,
+                    address::Network::Mainnet,
+                    request.account_index,
+                    request.address_index,
+                ) {
+                    Ok(public_key) => match address::public_address(&request.chain, &public_key) {
+                        Ok(public_address) => ExtensionResponse::Success(Web3AccountResponse {
+                            chain_id: address::chain_id_label(&request.chain),
+                            derivation_path: address::derivation_path(
+                                &request.chain,
+                                request.account_index,
+                                request.address_index,
+                            ),
+                            address: public_address,
+                            public_key_hex: hex::encode(public_key),
+                            scope: "public-address-only".to_string(),
+                            chain: request.chain,
+                            account_index: request.account_index,
+                            address_index: request.address_index,
+                        }),
+                        Err(error) => ExtensionResponse::<Web3AccountResponse>::Error(error),
+                    },
+                    Err(error) => ExtensionResponse::<Web3AccountResponse>::Error(error),
+                };
+                serde_json::to_vec(&response).map_err(|error| error.to_string())
+            }
+            ExtensionRequest::Web3ReadBalance(_)
+            | ExtensionRequest::Web3ReadNonce(_)
+            | ExtensionRequest::Web3EstimateFee(_)
+            | ExtensionRequest::EthereumPrepareTransaction(_)
+            | ExtensionRequest::EthereumSignTransaction(_) => {
+                let response = ExtensionResponse::<()>::Error(
+                    "lectura RPC Web3 requiere worker activo con NodeRegistry".to_string(),
+                );
                 serde_json::to_vec(&response).map_err(|error| error.to_string())
             }
             ExtensionRequest::SignTransaction(sign_request) => {
@@ -112,6 +174,22 @@ impl GatewaySupervisor {
                         return serde_json::to_vec(&response).map_err(|error| error.to_string());
                     }
                 };
+                let fiat_currency = self.firewall.rules.fiat_currency.clone();
+                if let Err(policy_error) = self.firewall.validate_account_policy(
+                    &parsed,
+                    sign_request.account_index,
+                    sign_request.address_index,
+                    effective_volume,
+                    sign_request.value_usd,
+                    &fiat_currency,
+                ) {
+                    self.register_integrity_failure(&policy_error, now);
+                    let response = ExtensionResponse::<()>::Error(format!(
+                        "politica de cuenta rechazada: {}",
+                        policy_error
+                    ));
+                    return serde_json::to_vec(&response).map_err(|error| error.to_string());
+                }
 
                 // Firmar primero para no desperdiciar contadores si la firma falla.
                 // Si el sandbox de firma está activo, la clave solo se usa dentro de un
@@ -119,12 +197,13 @@ impl GatewaySupervisor {
                 let signature_result = if crate::security::sign_sandbox::sign_sandbox_requested() {
                     let keymaster = &self.keymaster;
                     let chain = sign_request.chain.clone();
+                    let network = sign_request.network;
                     let account = sign_request.account_index;
                     let index = sign_request.address_index;
                     let payload = sign_request.raw_tx_payload.clone();
                     crate::security::sign_sandbox::run_isolated(move || {
                         let signature =
-                            keymaster.sign_transaction(&chain, account, index, &payload)?;
+                            keymaster.sign_transaction(&chain, network, account, index, &payload)?;
                         serde_json::to_vec(&signature).map_err(|error| error.to_string())
                     })
                     .and_then(|bytes| {
@@ -136,6 +215,7 @@ impl GatewaySupervisor {
                 } else {
                     self.keymaster.sign_transaction(
                         &sign_request.chain,
+                        sign_request.network,
                         sign_request.account_index,
                         sign_request.address_index,
                         &sign_request.raw_tx_payload,
@@ -150,7 +230,12 @@ impl GatewaySupervisor {
                 };
 
                 // Commit después de firma exitosa para que fallas de firma no desperdicien contadores.
-                if let Err(commit_error) = self.firewall.commit_transaction(effective_volume) {
+                if let Err(commit_error) = self.firewall.commit_transaction_context(
+                    &parsed,
+                    effective_volume,
+                    sign_request.value_usd,
+                    &fiat_currency,
+                ) {
                     self.register_integrity_failure(&commit_error, now);
                     let response = ExtensionResponse::<()>::Error(format!(
                         "commit rechazado: {}",
@@ -162,7 +247,26 @@ impl GatewaySupervisor {
                 let response = ExtensionResponse::Success(signature_response);
                 serde_json::to_vec(&response).map_err(|error| error.to_string())
             }
+            ExtensionRequest::BroadcastTransaction(_) => {
+                let response = ExtensionResponse::<()>::Error(
+                    "broadcast bloqueado: requiere adaptador RPC operativo auditado y politica local"
+                        .to_string(),
+                );
+                serde_json::to_vec(&response).map_err(|error| error.to_string())
+            }
         }
+    }
+
+    /// Límite de comisión nativa de la política de cuenta aplicable (C.5), si existe.
+    pub fn max_fee_native_for(
+        &self,
+        chain: &crate::crypto::blockchain::types::ChainType,
+        account_index: u32,
+        address_index: u32,
+    ) -> Option<rust_decimal::Decimal> {
+        self.firewall
+            .active_policy(chain, account_index, address_index)
+            .and_then(|policy| policy.max_fee_native)
     }
 
     pub fn preview_sign_transaction(
@@ -216,6 +320,18 @@ impl GatewaySupervisor {
                 return Err(error);
             }
         };
+        let fiat_currency = self.firewall.rules.fiat_currency.clone();
+        if let Err(error) = self.firewall.validate_account_policy(
+            &parsed,
+            sign_request.account_index,
+            sign_request.address_index,
+            effective_volume_units,
+            sign_request.value_usd,
+            &fiat_currency,
+        ) {
+            self.register_integrity_failure(&error, now);
+            return Err(format!("politica de cuenta rechazada: {}", error));
+        }
 
         Ok(SigningRequestPreview {
             request_id: 0,
@@ -228,6 +344,7 @@ impl GatewaySupervisor {
             target_dex_cex_id: sign_request.target_dex_cex_id.clone(),
             value_usd: sign_request.value_usd,
             effective_volume_units,
+            fee_estimate: None,
         })
     }
 

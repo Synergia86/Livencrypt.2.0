@@ -1206,6 +1206,51 @@ pub fn boot_shield_unlock(
     boot_shield_unlock_impl(cajas, frase, secondary_cajas, secondary_frase)
 }
 
+/// Verifica credenciales contra el vault SIN efectos secundarios:
+/// no incrementa el contador de intentos fallidos, no registra tombstones,
+/// no dispara el panico destructivo ni la clave de coaccion. Solo intenta descifrar
+/// el envelope en memoria y descarta el resultado. Pensado para re-confirmaciones
+/// de identidad (gate del auditor C.4), donde un typo NUNCA debe poner en riesgo el vault.
+pub fn verify_credentials_readonly(cajas: [i64; 5], frase: &str) -> bool {
+    if !vault_is_configured() {
+        return false;
+    }
+    let Ok(envelope) = read_envelope() else {
+        return false;
+    };
+    let Ok(secret) = normalize_secret(cajas, frase.to_string()) else {
+        return false;
+    };
+    decrypt_payload(&envelope, &secret, None).is_ok()
+}
+
+/// Igual que verify_credentials_readonly pero admite credencial secundaria (vaults dual-secret).
+/// Read-only: no toca contadores, tombstones ni dispara destruccion.
+pub fn verify_credentials_readonly_dual(
+    cajas: [i64; 5],
+    frase: &str,
+    secondary_cajas: Option<[i64; 5]>,
+    secondary_frase: Option<&str>,
+) -> bool {
+    if !vault_is_configured() {
+        return false;
+    }
+    let Ok(envelope) = read_envelope() else {
+        return false;
+    };
+    let Ok(secret) = normalize_secret(cajas, frase.to_string()) else {
+        return false;
+    };
+    let secondary = match normalize_secondary_secret(
+        secondary_cajas,
+        secondary_frase.map(|value| value.to_string()),
+    ) {
+        Ok(secondary) => secondary,
+        Err(_) => return false,
+    };
+    decrypt_payload(&envelope, &secret, secondary.as_ref()).is_ok()
+}
+
 fn boot_shield_unlock_impl(
     cajas: [i64; 5],
     frase: String,

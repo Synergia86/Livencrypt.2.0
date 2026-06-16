@@ -176,7 +176,9 @@ where
         read_result.map_err(|_| "el firmante aislado no devolvio longitud".to_string())?;
         let length = u32::from_le_bytes(length_buffer) as usize;
         if length == 0 {
-            return Err("el firmante aislado no produjo firma (aislamiento no disponible)".to_string());
+            return Err(
+                "el firmante aislado no produjo firma (aislamiento no disponible)".to_string(),
+            );
         }
         let mut payload = vec![0u8; length];
         stream
@@ -204,8 +206,7 @@ mod macos_sandbox {
         let profile =
             b"(version 1)(deny default)(allow process-fork)(allow file-read*)(deny network*)\0";
         let mut error_buffer: *mut c_char = std::ptr::null_mut();
-        let rc =
-            unsafe { sandbox_init(profile.as_ptr() as *const c_char, 0, &mut error_buffer) };
+        let rc = unsafe { sandbox_init(profile.as_ptr() as *const c_char, 0, &mut error_buffer) };
         if rc != 0 {
             unsafe {
                 if !error_buffer.is_null() {

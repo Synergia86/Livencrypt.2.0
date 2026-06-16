@@ -38,8 +38,26 @@ pub fn parse_tx_payload(chain: &ChainType, raw_tx_payload: &[u8]) -> Result<Pars
         ChainType::Ethereum => parse_ethereum_payload(raw_tx_payload),
         ChainType::Bitcoin => parse_bitcoin_payload(raw_tx_payload),
         ChainType::Solana => parse_solana_payload(raw_tx_payload),
-        ChainType::Monero => Err("Monero requiere parser forense especifico no integrado".into()),
+        ChainType::Monero => parse_monero_tx(raw_tx_payload),
+        ChainType::Zcash => parse_zcash_tx(raw_tx_payload),
+        ChainType::Starknet => parse_starknet_tx(raw_tx_payload),
     }
+}
+
+/// Monero (RingCT/stealth). NO INTEGRADO: requiere libreria forense auditada.
+/// Fail-closed: rechaza hasta que exista un parser que produzca ParsedTx real.
+fn parse_monero_tx(_raw: &[u8]) -> Result<ParsedTx, String> {
+    Err("Monero requiere parser forense especifico no integrado".into())
+}
+
+/// Zcash Sapling/Orchard. NO INTEGRADO. Fail-closed.
+fn parse_zcash_tx(_raw: &[u8]) -> Result<ParsedTx, String> {
+    Err("Zcash requiere parser Sapling/Orchard especifico no integrado".into())
+}
+
+/// Starknet (calldata / account abstraction). NO INTEGRADO. Fail-closed.
+fn parse_starknet_tx(_raw: &[u8]) -> Result<ParsedTx, String> {
+    Err("Starknet requiere parser de calldata/account abstraction no integrado".into())
 }
 
 fn parse_ethereum_payload(raw: &[u8]) -> Result<ParsedTx, String> {
@@ -85,6 +103,8 @@ fn parse_ethereum_payload(raw: &[u8]) -> Result<ParsedTx, String> {
             let v = bytes_to_u64(fields[6])?;
             let chain_id = if v >= 35 {
                 (v - 35) / 2
+            } else if fields[7].is_empty() && fields[8].is_empty() && v > 0 {
+                v
             } else {
                 return Err("Ethereum legacy sin chain_id EIP-155".into());
             };
@@ -474,6 +494,8 @@ pub fn native_units(chain: ChainType, value_units: u128) -> Decimal {
         ChainType::Bitcoin => Decimal::from(value_units) / Decimal::from(100_000_000u64),
         ChainType::Solana => Decimal::from(value_units) / Decimal::from(1_000_000_000u64),
         ChainType::Monero => Decimal::from(value_units),
+        ChainType::Zcash => Decimal::from(value_units),
+        ChainType::Starknet => Decimal::from(value_units),
     }
 }
 

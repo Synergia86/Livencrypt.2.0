@@ -2,9 +2,13 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: despachador dinámico de nodos de infraestructura desde nodes.toml */
 
+use crate::crypto::blockchain::types::{
+    NodeEndpointPolicy, VerifiedClockStatus, Web3ConnectivityProfile,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ChainNodesConfig {
@@ -17,7 +21,21 @@ struct ChainNodesConfig {
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct NodesFile {
     #[serde(default)]
+    profile: Web3ConnectivityProfile,
+    #[serde(default = "default_max_clock_drift_seconds")]
+    max_clock_drift_seconds: u64,
+    #[serde(default = "default_rpc_timeout_ms")]
+    timeout_ms: u64,
+    #[serde(default)]
     chain: Vec<ChainNodesConfig>,
+}
+
+fn default_max_clock_drift_seconds() -> u64 {
+    30
+}
+
+fn default_rpc_timeout_ms() -> u64 {
+    3_000
 }
 
 /// Ruta por defecto del catálogo de nodos en el directorio local de datos.
@@ -33,9 +51,23 @@ struct ChainNodes {
     active: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 pub struct NodeRegistry {
     chains: HashMap<String, ChainNodes>,
+    profile: Web3ConnectivityProfile,
+    max_clock_drift_seconds: u64,
+    timeout_ms: u64,
+}
+
+impl Default for NodeRegistry {
+    fn default() -> Self {
+        Self {
+            chains: HashMap::new(),
+            profile: Web3ConnectivityProfile::Offline,
+            max_clock_drift_seconds: default_max_clock_drift_seconds(),
+            timeout_ms: default_rpc_timeout_ms(),
+        }
+    }
 }
 
 impl NodeRegistry {
@@ -64,13 +96,92 @@ impl NodeRegistry {
                     endpoints.push(fallback);
                 }
             }
-            chains.insert(name, ChainNodes { endpoints, active: 0 });
+            chains.insert(
+                name,
+                ChainNodes {
+                    endpoints,
+                    active: 0,
+                },
+            );
         }
-        Ok(Self { chains })
+        Ok(Self {
+            chains,
+            profile: parsed.profile,
+            max_clock_drift_seconds: parsed.max_clock_drift_seconds,
+            timeout_ms: parsed.timeout_ms,
+        })
     }
 
     pub fn reload(&mut self, path: &Path) {
         *self = Self::load_from_path(path);
+    }
+
+    pub fn profile(&self) -> &Web3ConnectivityProfile {
+        &self.profile
+    }
+
+    pub fn set_profile(&mut self, profile: Web3ConnectivityProfile) {
+        self.profile = profile;
+    }
+
+    pub fn max_clock_drift_seconds(&self) -> u64 {
+        self.max_clock_drift_seconds
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+
+    pub fn cycle_profile(&mut self) -> Web3ConnectivityProfile {
+        self.profile = self.profile.next();
+        self.profile.clone()
+    }
+
+    pub fn connectivity_summary(&self) -> String {
+        let chains = self.chains.len();
+        let endpoints: usize = self
+            .chains
+            .values()
+            .map(|entry| entry.endpoints.len())
+            .sum();
+        match self.profile {
+            Web3ConnectivityProfile::Offline => {
+                format!(
+                    "OFFLINE: {} cadenas, {} endpoints registrados sin uso RPC",
+                    chains, endpoints
+                )
+            }
+            Web3ConnectivityProfile::RpcReadOnly => {
+                format!(
+                    "RPC LECTURA: {} cadenas, {} endpoints; broadcast bloqueado",
+                    chains, endpoints
+                )
+            }
+            Web3ConnectivityProfile::RpcOperational => {
+                format!(
+                    "RPC OPERATIVO: {} cadenas, {} endpoints; requiere politicas y confirmacion local",
+                    chains, endpoints
+                )
+            }
+        }
+    }
+
+    pub fn offline_verified_clock(&self) -> VerifiedClockStatus {
+        let local_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        VerifiedClockStatus {
+            local_unix,
+            consensus_unix: None,
+            drift_seconds: None,
+            max_drift_seconds: self.max_clock_drift_seconds,
+            status: if self.profile.allows_rpc_read() {
+                "RPC configurado; consenso pendiente de adaptador de cadena".to_string()
+            } else {
+                "OFFLINE: usando reloj local sin consenso de nodos".to_string()
+            },
+        }
     }
 
     pub fn current_endpoint(&self, chain: &str) -> Option<&str> {
@@ -106,6 +217,21 @@ impl NodeRegistry {
             .get(&chain.to_lowercase())
             .map(|entry| entry.active)
             .unwrap_or(0)
+    }
+
+    pub fn endpoint_policy(&self, chain: &str) -> Option<NodeEndpointPolicy> {
+        let key = chain.to_lowercase();
+        let entry = self.chains.get(&key)?;
+        let primary = entry.endpoints.first()?.clone();
+        Some(NodeEndpointPolicy {
+            chain: key,
+            primary_endpoint: primary,
+            fallback_endpoints: entry.endpoints.iter().skip(1).cloned().collect(),
+            allow_broadcast: self.profile.allows_broadcast(),
+            require_chain_id: String::new(),
+            max_clock_drift_seconds: self.max_clock_drift_seconds,
+            timeout_ms: self.timeout_ms,
+        })
     }
 
     /// Define el endpoint principal de una cadena, creándola si no existe.
@@ -149,8 +275,13 @@ impl NodeRegistry {
                 });
             }
         }
-        let serialized = toml::to_string(&NodesFile { chain })
-            .map_err(|error| format!("no se pudo serializar nodes.toml: {}", error))?;
+        let serialized = toml::to_string(&NodesFile {
+            profile: self.profile.clone(),
+            max_clock_drift_seconds: self.max_clock_drift_seconds,
+            timeout_ms: self.timeout_ms,
+            chain,
+        })
+        .map_err(|error| format!("no se pudo serializar nodes.toml: {}", error))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
@@ -164,10 +295,7 @@ mod tests {
     use super::*;
 
     fn write_temp(contents: &str) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "livencrypt-nodes-{}.toml",
-            contents.len()
-        ));
+        let path = std::env::temp_dir().join(format!("livencrypt-nodes-{}.toml", contents.len()));
         std::fs::write(&path, contents).expect("escribir nodes.toml temporal");
         path
     }

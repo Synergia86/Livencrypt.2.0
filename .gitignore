@@ -1,6 +1,23 @@
 # directorios de compilacion de rust
 /target/
 /src-tauri/target/
+/src-tui/target/
+
+# datos de ejecucion / runtime (vault, logs de auditoria, secretos)
+.livencrypt/
+
+# snapshots / indices de herramientas
+*.snapshot
+
+# copia anidada de proyecto de referencia dentro de DOCS (bloat/binarios, no es codigo del repo)
+DOCS/LIVENCRYPT 2.0/
+
+# notas y utilidades locales (no forman parte del proyecto)
+/Codex_sesión.txt
+/Recopilatorio_Livencrypt/
+/cambios_alexander.patch
+/generar_arbol.sh
+/recopila.sh
 
 # dependencias de javascript / tauri (si aplica)
 node_modules/

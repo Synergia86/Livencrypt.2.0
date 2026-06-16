@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: derivación de claves multiecosistema con zeroize en drop */
 
+use crate::crypto::blockchain::address::{coin_type_for, Network};
 use crate::crypto::blockchain::types::{ChainType, SignatureResponse};
 use crate::security::vault::derive_vault_key;
 use ed25519_dalek::{Signer, SigningKey};
@@ -41,15 +42,20 @@ impl UniversalKeymaster {
     fn derive_slip10_child(
         &self,
         chain: &ChainType,
+        network: Network,
         account: u32,
         index: u32,
     ) -> Result<[u8; 32], String> {
         match chain {
             ChainType::Bitcoin | ChainType::Ethereum => {
-                self.derive_bip32_secp256k1_child(coin_id(chain), account, index)
+                self.derive_bip32_secp256k1_child(coin_type_for(chain, network), account, index)
             }
             ChainType::Solana => self.derive_slip10_ed25519_child(account, index),
             ChainType::Monero => Err("Monero requiere derivacion aislada".into()),
+            ChainType::Zcash => Err("Zcash requiere derivacion Sapling/Orchard aislada".into()),
+            ChainType::Starknet => {
+                Err("Starknet requiere derivacion/firma Stark especifica".into())
+            }
         }
     }
 
@@ -91,10 +97,11 @@ impl UniversalKeymaster {
     pub fn get_public_key(
         &self,
         chain: &ChainType,
+        network: Network,
         account: u32,
         index: u32,
     ) -> Result<Vec<u8>, String> {
-        let mut raw_key = self.derive_slip10_child(chain, account, index)?;
+        let mut raw_key = self.derive_slip10_child(chain, network, account, index)?;
 
         let result = (|| -> Result<Vec<u8>, String> {
             match chain {
@@ -117,6 +124,12 @@ impl UniversalKeymaster {
                 ChainType::Monero => {
                     Err("Monero requiere derivacion multilave aislada no soportada".to_string())
                 }
+                ChainType::Zcash => {
+                    Err("Zcash requiere derivacion Sapling/Orchard no soportada".to_string())
+                }
+                ChainType::Starknet => {
+                    Err("Starknet requiere cuenta y firma Stark no soportadas".to_string())
+                }
             }
         })();
 
@@ -124,14 +137,44 @@ impl UniversalKeymaster {
         result
     }
 
+    /// Deriva la clave publica dos veces de forma independiente y las compara en
+    /// tiempo constante. Devuelve la clave solo si ambas pasadas coinciden.
+    /// Deriva de forma determinista una clave de firma Ed25519 dedicada a sellar el log
+    /// de auditoria Web3 (separada de las claves de cuenta). Estable para el mismo vault.
+    pub fn audit_signing_key(&self) -> SigningKey {
+        let material = hmac_sha512_bytes(b"Livencrypt Web3 Audit Signing", &self.master_seed)
+            .unwrap_or([0u8; 64]);
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes.copy_from_slice(&material[..32]);
+        let key = SigningKey::from_bytes(&sk_bytes);
+        sk_bytes.zeroize();
+        key
+    }
+
+    pub fn rederive_and_verify(
+        &self,
+        chain: &ChainType,
+        network: Network,
+        account: u32,
+        index: u32,
+    ) -> Result<Vec<u8>, String> {
+        let first = self.get_public_key(chain, network, account, index)?;
+        let second = self.get_public_key(chain, network, account, index)?;
+        if !constant_time_eq(&first, &second) {
+            return Err("derivacion no reproducible: las dos pasadas difieren".into());
+        }
+        Ok(first)
+    }
+
     pub fn sign_transaction(
         &self,
         chain: &ChainType,
+        network: Network,
         account: u32,
         index: u32,
         raw_payload: &[u8],
     ) -> Result<SignatureResponse, String> {
-        let mut raw_key = self.derive_slip10_child(chain, account, index)?;
+        let mut raw_key = self.derive_slip10_child(chain, network, account, index)?;
 
         let result = (|| -> Result<SignatureResponse, String> {
             match chain {
@@ -188,6 +231,12 @@ impl UniversalKeymaster {
                 ChainType::Monero => Err(
                     "Monero requiere un esquema especializado de firmas en anillo y payload multilave especifico".to_string(),
                 ),
+                ChainType::Zcash => Err(
+                    "Zcash requiere libreria ZK auditada y firma especifica Sapling/Orchard".to_string(),
+                ),
+                ChainType::Starknet => Err(
+                    "Starknet requiere firma Stark y validacion de contrato de cuenta".to_string(),
+                ),
             }
         })();
 
@@ -198,6 +247,18 @@ impl UniversalKeymaster {
 
 fn hardened(index: u32) -> u32 {
     index | 0x8000_0000
+}
+
+/// Comparacion en tiempo constante sin cortocircuito por contenido.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 fn hmac_sha512_bytes(key: &[u8], data: &[u8]) -> Result<[u8; 64], String> {
@@ -282,13 +343,3 @@ fn derive_slip10_ed25519_path(seed: &[u8; 64], path: &[u32]) -> Result<[u8; 32],
     Ok(key)
 }
 
-fn coin_id(chain: &ChainType) -> u32 {
-    match chain {
-        ChainType::Bitcoin => 0,
-        ChainType::Ethereum => 60,
-        ChainType::Solana => 501,
-        // Monero no alcanza aquí porque derive_slip10_child retorna Err antes.
-        // Valor documental para futuras cadenas BIP-44.
-        ChainType::Monero => 128,
-    }
-}

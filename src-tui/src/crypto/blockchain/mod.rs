@@ -2,14 +2,32 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: enrutador maestro del subsistema blockchain universal */
 
+pub mod address;
 pub mod breaker;
+pub mod chain_requirements;
+pub mod eth_abi;
+pub mod eth_rlp;
+pub mod eth_simulation;
+pub mod eth_tx;
+pub mod eth_types;
 pub mod firewall;
 pub mod multi_curve;
 pub mod nodes;
+pub mod preflight;
+pub mod price_import;
 pub mod proxy;
+pub mod rpc;
+pub mod rpc_bitcoin;
+pub mod rpc_client;
+pub mod rpc_ethereum;
+pub mod rpc_manager;
+pub mod rpc_quorum;
+pub mod rpc_solana;
+pub mod rpc_types;
 pub mod supervisor;
 pub mod tx_parser;
 pub mod types;
+pub mod web3_audit;
 pub mod worker;
 
 use crate::crypto::blockchain::tx_parser::{parse_tx_payload, ParsedTx};
@@ -98,5 +116,7 @@ pub fn adapter_for(chain: &ChainType) -> Result<Box<dyn ChainAdapter>, String> {
         ChainType::Ethereum => Ok(Box::new(EthereumAdapter)),
         ChainType::Solana => Ok(Box::new(SolanaAdapter)),
         ChainType::Monero => Err("Monero no soportado por los adaptadores de cadena".into()),
+        ChainType::Zcash => Err("Zcash no soportado por los adaptadores de cadena".into()),
+        ChainType::Starknet => Err("Starknet no soportado por los adaptadores de cadena".into()),
     }
 }

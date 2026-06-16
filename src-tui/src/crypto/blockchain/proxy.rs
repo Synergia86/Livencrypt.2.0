@@ -2,7 +2,11 @@
 // Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
 /* rol: host de mensajeria nativa seguro para extension web stateless */
 
-use crate::crypto::blockchain::types::{KeyDerivationRequest, TransactionSignRequest};
+use crate::crypto::blockchain::eth_types::EthereumPrepareTransactionRequest;
+use crate::crypto::blockchain::types::{
+    BroadcastTransactionRequest, KeyDerivationRequest, TransactionSignRequest, Web3AccountRequest,
+    Web3EstimateFeeRequest, Web3ReadBalanceRequest, Web3ReadNonceRequest,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
 use zeroize::Zeroize;
@@ -12,8 +16,16 @@ const MAX_NATIVE_MESSAGE_BYTES: usize = 1024 * 1024;
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ExtensionRequest {
+    Web3Status,
     DeriveKey(KeyDerivationRequest),
+    Web3Account(Web3AccountRequest),
+    Web3ReadBalance(Web3ReadBalanceRequest),
+    Web3ReadNonce(Web3ReadNonceRequest),
+    Web3EstimateFee(Web3EstimateFeeRequest),
+    EthereumPrepareTransaction(EthereumPrepareTransactionRequest),
+    EthereumSignTransaction(EthereumPrepareTransactionRequest),
     SignTransaction(TransactionSignRequest),
+    BroadcastTransaction(BroadcastTransactionRequest),
 }
 
 #[derive(Serialize, Deserialize)]
