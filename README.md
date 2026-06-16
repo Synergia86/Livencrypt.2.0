@@ -1,13 +1,15 @@
-Livencrypt 2.0
+# Livencrypt 2.0
 
-Livencrypt 2.0 es una suite criptográfica avanzada de confianza cero (zero-trust) y pasarela de custodia universal diseñada en Rust para operar de manera local y descentralizada a través de una interfaz interactiva de terminal (TUI). El sistema proporciona un entorno fortificado para el cifrado posicional de datos, la gestión de almacenamiento criptográfico blindado en memoria volátil y la intermediación segura de operaciones Web3 con navegadores web mediante canales de comunicación aislados (IPC).
+Livencrypt 2.0 es una suite criptográfica avanzada de confianza cero (zero-trust) y **pasarela de custodia universal** diseñada en Rust para operar de manera local y descentralizada a través de una interfaz interactiva de terminal (TUI). El sistema proporciona un entorno fortificado para el cifrado posicional de datos, la gestión de almacenamiento criptográfico blindado en memoria volátil y la **intermediación segura de operaciones Web3** con navegadores web (compatibles con dApps como Dextools, Uniswap, etc.) mediante una extensión EIP-1193 y canales de comunicación aislados (IPC). Incluye un **auditor visual de direcciones públicas** y un **registro de auditoría firmado** a prueba de manipulaciones.
 
-1. Arquitectura y modelo de confianza cero
-La suite está estructurada bajo una filosofía de diseño compartimentado para mitigar de raíz la persistencia de secretos en entornos inseguros (como el espacio de memoria de un navegador de internet).
+## 1. Arquitectura y modelo de confianza cero
 
+La suite está estructurada bajo una filosofía de diseño compartimentado para mitigar de raíz la persistencia de secretos en entornos inseguros (como el espacio de memoria de un navegador). **La clave privada nunca abandona el núcleo seguro local.**
+
+```
                                   [ENTORNO INSEGURO]
                            +------------------------------+
-                           | Extensión web stateless (JS) |
+                           | Extensión web EIP-1193 (JS)  |  <- window.ethereum / window.livencrypt
                            +--------------+---------------+
                                           |
                         Mensajería nativa (Payloads JSON)
@@ -15,7 +17,7 @@ La suite está estructurada bajo una filosofía de diseño compartimentado para 
                                   [CORTAFUEGOS IPC]
                            +--------------v---------------+
                            |  Host puente de mensajería   |
-                           |    (livencrypt-bridge)       |
+                           |    (com.livencrypt.gateway)  |
                            +--------------+---------------+
                                           |
                               Socket Unix (Permisos 0600)
@@ -30,140 +32,159 @@ La suite está estructurada bajo una filosofía de diseño compartimentado para 
      |  |   |   LiveFirewall     |---->|       GatewaySupervisor        |   |  |
      |  |   | (Cuotas / Límites) |     | (run_loop_iteration / Sockets) |   |  |
      |  |   +--------------------+     +---------------+----------------+   |  |
+     |  |            |                                 |                    |  |
+     |  |   +--------v---------+         +-------------v--------------+     |  |
+     |  |   | RPC Manager      |         | Auditoría firmada (Ed25519)|     |  |
+     |  |   | (quórum de nodos)|         | web3_audit.jsonl encadenada|     |  |
+     |  |   +------------------+         +----------------------------+     |  |
      |  +----------------------------------------------|--------------------+  |
-     |                                                 |                       |
      |                                     Canal asíncrono MPSC                |
-     |                                                 |                       |
      |                      Hilo maestro interactivo   v                       |
      |  +-------------------------------------------------------------------+  |
      |  |                          Bucle TUI Ratatui                        |  |
-     |  |               (Gestión gráfica / Caching de TuiState)             |  |
+     |  |    Pasarela "w" (custodia/firma)  ·  Auditor "k" (direcciones)    |  |
      |  +-------------------------------------------------------------------+  |
      +-------------------------------------------------------------------------+
-El núcleo de la aplicación se divide en tres capas asíncronas concurrentes libres de bloqueos físicos:
+```
 
-1 Hilo maestro interactivo (TUI): Gobierna el renderizado gráfico mediante Ratatui y Crossterm. Consume de manera reactiva las alertas de red de los canales MPSC y manipula una caché interna local (TuiState) para evitar colisiones de préstamos de memoria (borrow checker).
+El núcleo se divide en hilos asíncronos concurrentes:
 
-2 Hilo perimetral de lectura Unix (Socket Reader): Escucha peticiones externas a través de un descriptor de socket local seguro con un límite estricto de hilos concurrentes para neutralizar ataques de denegación de servicio (DoS).
+1. **Hilo maestro interactivo (TUI):** renderiza con Ratatui/Crossterm, consume eventos del worker por canales MPSC y mantiene una caché local (`TuiState`).
+2. **Hilo perimetral de lectura Unix:** escucha peticiones externas con límite estricto de conexiones concurrentes (anti-DoS / anti-slowloris).
+3. **Hilo del supervisor (Background Worker):** valida en caliente el cortafuegos, orquesta el llavero multicurva, gestiona los adaptadores RPC y sella la auditoría.
 
-3 Hilo maestro del supervisor (Background Worker): Orquesta de forma asíncrona la validación en caliente del cortafuegos de políticas y coordina la ejecución del llavero multiecurva en memoria blindada.
+## 2. Características principales
 
-2. Características principales y lógica de control
-A. Cifrado posicional de texto y archivos autenticados
-· Agnosticismo de datos: El motor dinámico PositionalCipher utiliza matrices de sustitución y permutación complejas basadas en plantillas lingüísticas estructuradas. Procesa caracteres internacionales (tablas nativas de chino, coreano, katakana, árabe, entre otras) eliminando codificaciones Unicode corruptas.
+### A. Cifrado posicional de texto y archivos autenticados
+- **Agnosticismo de datos:** el motor `PositionalCipher` usa matrices de sustitución/permutación basadas en plantillas lingüísticas (chino, coreano, katakana, árabe, etc.), eliminando codificaciones Unicode corruptas.
+- **Cifrado de archivos con doble factor de secreto:** `FileCipher` separa estrictamente la referencia pública del HUD de la frase mnemónica real del archivo.
 
-· Cifrado de archivos con doble factor de secreto: El subsistema FileCipher implementa un flujo de cifrado autenticado de archivos que separa de manera estricta la referencia pública visualizada en el HUD de la frase mnemónica real del archivo. Bloquea de forma impositiva cualquier regresión de código o reutilización accidental de metadatos visibles como material de clave criptográfica.
+### B. Pasarela Web3 asíncrona y custodia universal (tecla `w`)
+- **Llavero multicurva volátil (`UniversalKeymaster`):** `master_seed` de 64 bytes derivada por KDF sobre la matriz de 5 cajas + frase maestra. Derivación determinista BIP-32/BIP-44/SLIP-10:
+  - **secp256k1** (ECDSA) para Bitcoin y Ethereum.
+  - **ed25519** (Edwards) para Solana.
+  - Cadenas que requieren criptografía especializada (Monero/Zcash/Starknet) se **rechazan de forma determinista** (fail-closed).
+- **Autorización local en dos pasos:** ninguna **firma** ni **broadcast** ocurre sin confirmación física (F10/A) en la consola; nunca se firma a ciegas (se parsea y se muestra método, destino, valor y **comisión estimada**).
+- **Broadcast en dos pasos auditado:** el envío real a la red solo procede con perfil `RpcOperational`, nodo auditado y autorización local, registrándose en la auditoría firmada.
+- **Importación de precios firmados (`.lvcprices`, Ed25519):** oráculo offline para valoración fiat.
+- **Políticas por cuenta, reglas programadas e inspector RPC:** límites por cuenta/ventana, **comisión máxima por política**, lecturas de saldo/nonce/fee/estado por cadena.
+- **Conciencia de red testnet/mainnet** y firma network-aware.
 
-B. Pasarela Web3 asíncrona y custodia universal
-· Llavero multiecurva volátil: La clase UniversalKeymaster almacena una master_seed de 64 bytes calculada mediante funciones KDF combinadas sobre la matriz de 5 cajas lógicas y la frase mnemónica del operador. Deriva claves deterministas bajo el estándar BIP-32/BIP-44 y SLIP-0044 para los principales ecosistemas criptográficos:
+### C. Auditor visual de direcciones públicas (tecla `k`)
+- **Deriva claves públicas sin firmar nunca** (aislamiento criptográfico del motor de custodia).
+- **Checksum EIP-55** en Ethereum (anti-typo) y validación de checksum de entrada (Base58Check / Base58).
+- **Re-derivación verificable** (tecla `V`): doble derivación comparada en tiempo constante para detectar inconsistencias antes de recibir fondos.
+- **Comparación anti-spoofing:** se teclea/pega la dirección esperada, se valida su checksum y se compara con la derivada.
+- **SegWit/bech32 (P2WPKH)** para Bitcoin (`bc1`/`tb1`) y direcciones por red correcta.
+- **QR + vínculo público** (sin secretos) y **gate de re-confirmación Boot Shield** antes de derivar/verificar/exportar.
 
-· Curva secp256k1: Firma transacciones ECDSA compactas para Bitcoin y Ethereum. En la red Ethereum, trunca de manera exacta el prefijo de control geométrico de 1 byte (0x04) para devolver la estructura nativa de 64 bytes requerida por las APIs del navegador.
+### D. Cortafuegos de políticas activo (`LiveFirewall`)
+Cada solicitud de firma supera una evaluación lineal antes de exponer material criptográfico: límite de frecuencia (`max_daily_tx`), límite de volumen/valor fiat (**personalizable a cualquier valor**, `0` = ilimitado), validación obligatoria de destino contra **listas blancas de DEX/CEX**, `chain_id` (anti-replay), política por cuenta y **comisión máxima**. Las cuotas solo se asientan si la firma tiene éxito.
 
-· Curva ed25519: Genera llaves y firmas de Edwards nativas sobre la carga útil completa del payload para la red Solana.
+### E. Disyuntor táctico (Circuit Breaker)
+`Operational` → `Frozen` (congelación forense ante violación) → `HardLocked` (aislamiento permanente tras 3 fallos de integridad, requiere reinicio del binario). Rearme físico local con las 5 cajas + frase maestra, comparación en tiempo constante y borrado `Zeroize`.
 
-· Aislamiento perimetral: Las solicitudes dirigidas a redes que requieren criptografía especializada de firmas en anillo (como Monero) se rechazan de manera determinista en el backend para preservar la seguridad de la clave.
+### F. Auditoría firmada e integridad
+- **Registro Web3 encadenado y firmado (Ed25519):** cada decisión se enlaza por hash y se firma con una clave de dispositivo derivada del vault; eleva la garantía de "detecta edición parcial" a "detecta reescritura total". Verificable desde la UI (`V` en el Monitor de Auditoría).
+- **Verificador de credenciales read-only sin efectos** para re-confirmaciones de identidad (un fallo no toca el contador del vault), con **opción destructiva configurable** (Ajustes, tecla `Z`) para quien mantiene backup externo.
 
-C. Cortafuegos de políticas activo (Firewall)
-· Cada solicitud de firma enviada desde el navegador web debe superar una evaluación lineal antes de que el núcleo exponga el material criptográfico:
+### G. Extensión Web3 EIP-1193 (para Dextools y dApps)
+- Proveedor `window.ethereum`/`window.livencrypt` (Manifest V3) que enruta cada método al núcleo seguro vía host nativo `com.livencrypt.gateway`.
+- Allowlist de orígenes por dominio (TTL 24 h, por método); errores normalizados EIP-1193 (`4001/4100/4200/4900`).
+- Métodos operativos: `eth_requestAccounts`, `eth_accounts`, `eth_chainId`, `net_version`, `eth_getBalance`, `eth_getTransactionCount`, `eth_gasPrice`, `livencrypt_prepareTransaction`, `eth_sendTransaction`, `livencrypt_status`.
+- Pendientes (hoja de ruta): `eth_estimateGas`, `personal_sign`, `eth_signTypedData_v4` (EIP-712/Permit2) y conmutación multicadena. Detalle de uso con Dextools en `DOCS/UTILIDAD_LIVENCRYPT_PARA_DEXTOOLS.md` (local).
 
-· Límite de frecuencia (Límite X): Controla la cuota diaria acumulada de transacciones autorizadas (max_daily_tx) para impedir la automatización maliciosa de drenajes de fondos.
+### H. Blindaje del sistema operativo y memoria
+- **Process Hardening:** `libc::prctl` deshabilita volcados (`PR_SET_DUMPABLE = 0`), restringe ptrace y fija `RLIMIT_CORE = 0`.
+- **Boot Shield:** cifra plantillas críticas en reposo con ChaCha20Poly1305, las monta en RAM aislada y destruye trazas mediante ganchos de initramfs.
+- **Seccomp y sandbox de firma:** la firma puede ejecutarse en un proceso hijo aislado por *namespaces* (sin red); filtros seccomp del sistema.
+- **Monitor heurístico (`ai_monitor`):** puntúa syscalls anómalas (inyección, montajes corruptos, depuradores) y puede disparar el aislamiento del llavero.
 
-· Límite de volumen monetario (Límite Y): Evalúa el impacto financiero estimado en dólares de la transacción (max_daily_volume_usd) frente al acumulado diario consumido.
+### I. Usabilidad y prevención de errores de entrada
+- **Pegado del portapapeles:** `Ctrl+V` o **doble clic** sobre la caja pegan los datos (evita errores al teclear direcciones/IDs).
+- **Validación por tipo de campo:** los campos numéricos (USD/BTC/ETH y montos) solo aceptan dígitos + separador decimal; los de texto aceptan texto+números+caracteres especiales.
 
-· Validación criptográfica de infraestructuras: Exige de forma obligatoria un identificador inmutable de destino (target_dex_cex_id). Contrasta el ID en tiempo real mediante búsquedas acotadas contra listas blancas estrictas de contratos autorizados de DEX (ej. exchanges descentralizados) y billeteras de depósito de CEX.
+## 3. Estructura del proyecto
 
-· Asentamiento diferido de cuotas: El cortafuegos aprueba la inspección perimetral de forma preliminar, pero solo asienta e incrementa las cuotas diarias consumidas (commit_transaction) si el motor multiecurva logra firmar la transacción de manera exitosa, evitando denegaciones de servicio artificiales por fallos de red externos.
-
-D. Disyuntor táctico de seguridad (Circuit Breaker)
-· Congelación forense inmediata: Si el cortafuegos detecta una solicitud hacia un destino no autorizado o una violación de cuotas, invoca el método trip_breaker, mutando instantáneamente el estado operativo a Frozen y bloqueando el acceso al llavero de Rust.
-
-· Bloqueo terminal de integridad: Si se acumulan 3 fallos consecutivos en el perímetro, el disyuntor salta a HardLocked, un estado de aislamiento permanente e irrecuperable en caliente que suspende la comunicación y requiere el reinicio físico del binario completo.
-
-· Rearme físico local por matriz: Para restablecer una pasarela congelada (Frozen), el operador debe acudir físicamente a la consola local y teclear las credenciales exactas de desbloqueo (combinación de las 5 cajas de la matriz y la frase maestra). Los bytes secretos se evalúan directamente sobre la referencia de memoria (std::str::from_utf8), aplicando un borrado destructivo atómico mediante el trait Zeroize en cuanto finaliza la rutina.
-
-E. Blindaje del sistema operativo y protección de memoria
-· Process Hardening: La rutina de inicialización aplica directivas estrictas del kernel Linux mediante llamadas libc::prctl para inhabilitar de forma permanente los volcados de memoria (PR_SET_DUMPABLE = 0), restringe el radio de traza de ptrace y reduce el límite del recurso RLIMIT_CORE a cero absoluto.
-
-· Boot Shield (Aislamiento de arranque): Mecanismo de contención que encripta de manera hermética las plantillas críticas del sistema en reposo utilizando el cifrado simétrico ChaCha20Poly1305. Durante el arranque, monta las estructuras en un directorio temporal aislado en RAM y destruye las trazas originales mediante ganchos avanzados sincronizados con initramfs.
-
-· Monitor heurístico integrado: Evalúa de manera proactiva las llamadas al sistema (syscalls) realizadas por el proceso, asignando puntuaciones de riesgo ante comportamientos anómalos que sugieran inyecciones de código, montajes corruptos o intentos de monitorización por depuradores locales.
-
-3. Estructura del proyecto
-El árbol del repositorio divide las responsabilidades del sistema de la siguiente manera:
-
-├── Cargo.toml                      # Declaración de dependencias criptográficas y empaquetado
-├── DOCS/                           # Documentación técnica y especificaciones de Tauri
+```
+├── Cargo.toml                          # Dependencias criptográficas y empaquetado
+├── README.md
+├── DOCS/                               # Documentación local (no versionada)
 ├── src-tui/
-│   ├── scripts/
-│   │   ├── com.livencrypt.gateway.json # Manifiesto de mensajería nativa para navegadores web
-│   │   ├── build-deb.sh            # Script de compilación del paquete de distribución Debian
-│   │   ├── postinstall.sh          # Configuración post-instalación de AppArmor y límites
-│   │   └── postremove.sh           # Purga segura de archivos temporales del host
+│   ├── extension/livencrypt-web3/      # Extensión Web3 EIP-1193 (Manifest V3)
+│   │   ├── manifest.json  background.js  content.js  inject.js  popup.*
+│   ├── scripts/                        # Empaquetado, AppArmor, initramfs, mensajería nativa
+│   ├── tests/blockchain_gateway_tests.rs
 │   └── src/
-│       ├── lib.rs                  # Inicializador del núcleo y endurecimiento de procesos
-│       ├── main.rs                 # Punto de entrada de la TUI y bucle de pintado reactivo
+│       ├── lib.rs                      # Inicializador del núcleo y endurecimiento
+│       ├── main.rs                     # TUI: pasarela "w", auditor "k", pegado validado
 │       ├── crypto/
-│       │   ├── file_cipher.rs      # Flujo de cifrado autenticado de archivos
-│       │   ├── positional.rs       # Motor de álgebra posicional multilingüe
-│       │   └── blockchain/         # Subsistema de pasarela Web3 y gobernanza criptográfica
-│       │       ├── breaker.rs      # Estado del disyuntor táctico de contención
-│       │       ├── firewall.rs     # Validación de cuotas de volumen e identificadores
-│       │       ├── multi_curve.rs  # Derivación BIP-32/44 en curvas secp256k1 y ed25519
-│       │       ├── proxy.rs        # Canal seguro de mensajería nativa stateless
-│       │       ├── supervisor.rs   # Orquestador y servidor de sockets Unix de contingencia
-│       │       └── worker.rs       # Hilo asíncrono secundario y control anti-slowloris
+│       │   ├── file_cipher.rs  positional.rs  secure_text.rs
+│       │   └── blockchain/             # Subsistema Web3 y gobernanza criptográfica
+│       │       ├── address.rs          # Direcciones (EIP-55, P2PKH/P2WPKH, red, checksums)
+│       │       ├── breaker.rs          # Disyuntor táctico
+│       │       ├── chain_requirements.rs
+│       │       ├── eth_abi.rs  eth_rlp.rs  eth_simulation.rs  eth_tx.rs  eth_types.rs
+│       │       ├── firewall.rs         # Cuotas, listas blancas, política de cuenta/comisión
+│       │       ├── multi_curve.rs      # BIP-32/44 secp256k1 + SLIP-10 ed25519, clave de auditoría
+│       │       ├── nodes.rs            # Registro de nodos y perfiles de conectividad
+│       │       ├── preflight.rs        # Análisis de riesgo pre-firma Ethereum
+│       │       ├── price_import.rs     # Importación de precios firmados (.lvcprices)
+│       │       ├── proxy.rs            # Canal de mensajería nativa stateless
+│       │       ├── rpc.rs  rpc_manager.rs  rpc_quorum.rs  rpc_client.rs  rpc_types.rs
+│       │       ├── rpc_bitcoin.rs  rpc_ethereum.rs  rpc_solana.rs
+│       │       ├── supervisor.rs       # Orquestador, firma, prevalidación, sockets Unix
+│       │       ├── tx_parser.rs        # Parseo de transacciones (sin firma a ciegas)
+│       │       ├── types.rs            # Tipos compartidos (peticiones/respuestas/políticas)
+│       │       ├── web3_audit.rs       # Auditoría encadenada y firmada (Ed25519)
+│       │       └── worker.rs           # Worker asíncrono, broadcast, anti-slowloris
 │       └── security/
-│           ├── ai_monitor.rs       # Puntuación heurística de riesgo de syscalls
-│           ├── apparmor.rs         # Generación dinámica de perfiles MAC del kernel
-│           └── boot_shield.rs      # Orquestador de initramfs y ChaCha20Poly1305
-4. Requisitos del sistema e instalación
-Requisitos previos
-· Sistema operativo Linux (kernel fortificado con soporte AppArmor activo recomendado).
+│           ├── ai_monitor.rs  apparmor.rs  audit.rs  boot_shield.rs  forensics.rs
+│           ├── install_profile.rs  loader.rs  network_profile.rs  platform_windows.rs
+│           ├── process_hardening.rs  recovery.rs  sandbox.rs  seccomp.rs
+│           ├── sign_sandbox.rs        # Firma en proceso hijo aislado (sin red)
+│           ├── updates.rs
+│           └── vault.rs               # Boot Shield, derivación de clave, verificador read-only
+```
 
-· Rustc y Cargo (edición de compilación 2021 o superior).
+## 4. Requisitos del sistema e instalación
 
-· Navegador web compatible con mensajería nativa (Brave, Google Chrome o Chromium).
+**Requisitos previos:** Linux (kernel con AppArmor recomendado), Rustc/Cargo (edición 2021+), navegador con mensajería nativa (Brave, Chrome o Chromium).
 
-Compilación y empaquetado Debian nativo
-La suite cuenta con utilidades automatizadas para generar paquetes de distribución nativa de arquitectura cruzada (amd64, arm64, etc.). Para compilar y empaquetar el binario, ejecuta:
-
-# Otorgar permisos de ejecución al script de empaquetado
+**Compilación y empaquetado Debian:**
+```bash
 chmod +x src-tui/scripts/build-deb.sh
-
-# Compilar e inicializar la infraestructura de empaquetado
 ./src-tui/scripts/build-deb.sh
-El script compilará el binario optimizado en modo de producción (--release), creará la estructura de directorios y generará el archivo ejecutable listo para su despliegue. Instala el paquete resultante haciendo uso del gestor de tu sistema:
-
 sudo dpkg -i target/debian/livencrypt-core_2.11.0_amd64.deb
-Despliegue automático de políticas de seguridad
-Al instalar el paquete Debian, las utilidades de diagnóstico configuran de manera atómica el host:
+```
 
-1 Límites del sistema (99-livencrypt.conf): Configura directivas estrictas en los límites del sistema operativo del operador, deshabilitando de forma permanente la escritura de archivos de volcado de memoria (core 0) y bloqueando la memoria física en RAM para evitar intercambios a disco duro (swap swapping).
+Al instalar, las utilidades configuran de forma atómica: límites del sistema (`99-livencrypt.conf`, core 0 + mlock), confinamiento AppArmor (`usr.bin.livencrypt-core`) y el registro del manifiesto de mensajería nativa (`com.livencrypt.gateway.json`) en Chrome/Chromium/Brave.
 
-2 Confinamiento AppArmor: Genera y carga el perfil MAC (usr.bin.livencrypt-core) en el espacio de ejecución del kernel para restringir los accesos físicos del ejecutable exclusivamente a sus dependencias operativas.
+**Extensión Web3:** cargar `src-tui/extension/livencrypt-web3/` en el navegador (modo desarrollador) y aprobar el dominio de la dApp (p. ej. `dextools.io`) la primera vez.
 
-3 Registro de mensajería nativa: Copia de forma simétrica el manifiesto JSON (com.livencrypt.gateway.json) en las rutas globales de configuración de Chrome, Chromium y Brave, permitiendo que la extensión local localice la pasarela de desvío asíncrona.
+## 5. Uso básico
 
-5. Instrucciones de uso básico
-Inicialización de la TUI
-Para arrancar el panel interactivo de terminal con los mecanismos de protección de procesos activos, invoca el núcleo:
-
+```bash
 livencrypt-core
-Al iniciar la sesión por primera vez, el sistema ejecutará el análisis heurístico preventivo de llamadas al sistema y te solicitará configurar la matriz táctica de 5 cajas numéricas y la frase maestra para instanciar el llavero volátil en RAM.
+```
+En el primer arranque se ejecuta el análisis heurístico y se solicita configurar la matriz de 5 cajas + frase maestra para instanciar el llavero volátil en RAM.
 
-Controles de navegación interactiva
-· Tab: Permite conmutar el enfoque de edición entre los campos numéricos de límites diarios del cortafuegos y los registros de las listas blancas.
+**Controles principales:**
+- `w` — Pasarela Web3 / custodia · `k` — Auditor visual de direcciones.
+- En la pasarela: `P` políticas · `S` reglas · `$` precios · `I` inspector RPC · `N` nodos · `M` perfil · `Y` red · `R` rearme del disyuntor.
+- Firma/broadcast: `F10`/`A` autoriza · `Esc`/`D` rechaza.
+- En el auditor: `Enter` deriva · `V` verifica (doble derivación) · `C` copia · `n` red · `[Verificar]` compara dirección.
+- Entrada de datos: `Ctrl+V` o **doble clic** pegan del portapapeles (validado por tipo de campo).
+- Ajustes: `Z` activa/desactiva la re-confirmación destructiva del auditor.
+- `Tab` cambia de campo · `Esc` vuelve al Dashboard.
 
-· Enter: Procesa y valida el texto introducido en el campo activo. Si se introducen límites numéricos, los transmite de forma asíncrona al worker secundario para su actualización en caliente.
+## 6. Licencia y derechos de autor
 
-· Char 'R' / 'r': Abre de manera forzada el modal flotante de emergencia para el rearme físico del disyuntor de seguridad en caso de congelación por alertas Web3.
+Software libre bajo **GNU General Public License v3.0**.
 
-· Esc: Regresa de manera segura al cuadro de mandos principal (Dashboard).
-
-6. Licencia y derechos de autor
-Este programa es software libre: puedes redistribuirlo y/o modificarlo bajo los términos de la GNU General Public License v3.0 tal como está publicada por la Free Software Foundation.
-
+```
 SPDX-License-Identifier: GPL-3.0-or-later
 Copyright (C) 2026 Synergia86 <livencrypt1@gmail.com>
+```
 
-El código fuente de este proyecto incluye las cabeceras digitales de validación estática de licencias exigidas por los indexadores de software de código abierto. Consulta el archivo LICENSE adjunto en la raíz del repositorio para leer el texto legal íntegro y las garantías de exención de responsabilidad correspondientes.
+Consulta el archivo `LICENSE` en la raíz del repositorio para el texto legal íntegro y las garantías de exención de responsabilidad.
