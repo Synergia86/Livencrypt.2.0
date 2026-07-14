@@ -31,7 +31,7 @@ const LEGACY_FORMAT_VERSION: u16 = 1;
 const TEMPLATE_FORMAT_VERSION: u16 = 2;
 const AEAD_ALGORITHM: &str = "xchacha20poly1305";
 const KDF_ALGORITHM: &str = "argon2id";
-const DEFAULT_BOOT_TEMPLATE_NAME: &str = "Livencrypt";
+const DEFAULT_BOOT_TEMPLATE_NAME: &str = "filelivencrypt";
 const CREDENTIAL_MODE_SINGLE: &str = "single";
 const CREDENTIAL_MODE_DOUBLE: &str = "double";
 const MAX_FAILED_ATTEMPTS: u32 = 5;
@@ -988,7 +988,10 @@ fn resolve_boot_template(
         .get(requested_name)
         .cloned()
         .or_else(|| {
-            if requested_name == DEFAULT_BOOT_TEMPLATE_NAME || requested_name == "filelivencrypt" {
+            if requested_name == DEFAULT_BOOT_TEMPLATE_NAME
+                || requested_name == "filelivencrypt"
+                || requested_name == "Livencrypt"
+            {
                 Some(filelivencrypt_template())
             } else {
                 None

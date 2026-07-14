@@ -2018,24 +2018,23 @@ pub fn initialize_defaults() -> Result<(), String> {
         fs::create_dir_all(&dir_path).map_err(|e| e.to_string())?;
     }
 
-    for legacy_name in [
-        "Plantilla_1",
-        "Plantilla_2",
-        "Plantilla_3",
-        "Plantilla_4",
-        "Plantilla_5",
-        "filelivencrypt",
-    ] {
-        let legacy_path = dir_path.join(format!("{}.msgpack", legacy_name));
-        if legacy_path.exists() {
-            fs::remove_file(&legacy_path).map_err(|e| {
-                format!("Error al eliminar plantilla legacy {}: {}", legacy_name, e)
-            })?;
+    // Por defecto solo debe existir la plantilla "filelivencrypt"; eliminar cualquier otra
+    // (presets Plantilla_1..5, plantillas de prueba, el alias legacy "Livencrypt", etc.).
+    if let Ok(entries) = fs::read_dir(&dir_path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_msgpack = path.extension().and_then(|e| e.to_str()) == Some("msgpack");
+            let is_default = path.file_stem().and_then(|s| s.to_str()) == Some("filelivencrypt");
+            if is_msgpack && !is_default {
+                fs::remove_file(&path).map_err(|e| {
+                    format!("Error al eliminar plantilla no predeterminada {:?}: {}", path, e)
+                })?;
+            }
         }
     }
 
-    if !dir_path.join("Livencrypt.msgpack").exists() {
-        save_template("Livencrypt".to_string(), filelivencrypt_template())?;
+    if !dir_path.join("filelivencrypt.msgpack").exists() {
+        save_template("filelivencrypt".to_string(), filelivencrypt_template())?;
     }
 
     Ok(())

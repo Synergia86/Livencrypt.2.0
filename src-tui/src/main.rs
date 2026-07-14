@@ -53,7 +53,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroize;
 
 const INVALID_ACCESS: &str = "CREDENCIALES INVALIDAS O VAULT MANIPULADO";
-const DEFAULT_TEMPLATE: &str = "Livencrypt";
+const DEFAULT_TEMPLATE: &str = "filelivencrypt";
 const DEFAULT_FILE_REFERENCE: &str = "LIVENCRYPT-FILE";
 const DEFAULT_FILE_SECRET: &str = "LIVENCRYPT-FILE-SECRET";
 const TEMPLATE_ROWS: u32 = 5;
@@ -416,7 +416,7 @@ fn run_safe_self_test() -> Result<(), String> {
 fn safe_test_templates() -> Result<(), String> {
     let templates = livencrypt_lib::load_templates()?;
     if !templates.contains_key(DEFAULT_TEMPLATE) {
-        return Err("No se cargo la plantilla Livencrypt por defecto.".into());
+        return Err("No se cargo la plantilla filelivencrypt por defecto.".into());
     }
 
     let name = "SelfTestTemplate".to_string();
