@@ -86,7 +86,7 @@ Cada solicitud de firma supera una evaluación lineal antes de exponer material 
 
 ### F. Auditoría firmada e integridad
 - **Registro Web3 encadenado y firmado (Ed25519):** cada decisión se enlaza por hash y se firma con una clave de dispositivo derivada del vault; eleva la garantía de "detecta edición parcial" a "detecta reescritura total". Verificable desde la UI (`V` en el Monitor de Auditoría).
-- **Verificador de credenciales read-only sin efectos** para re-confirmaciones de identidad (un fallo no toca el contador del vault), con **opción destructiva configurable** (Ajustes, tecla `Z`) para quien mantiene backup externo.
+- **Verificador de credenciales read-only sin efectos** para re-confirmaciones de identidad (un fallo no toca el contador del vault), compatible con **credencial única o doble** (5 cajas + frase, con segunda credencial opcional), y con **opción destructiva configurable** (Ajustes, tecla `Z`) para quien mantiene backup externo.
 
 ### G. Extensión Web3 EIP-1193 (para dApps)
 - Proveedor `window.ethereum`/`window.livencrypt` (Manifest V3) que enruta cada método al núcleo seguro vía host nativo `com.livencrypt.gateway`.
@@ -96,7 +96,7 @@ Cada solicitud de firma supera una evaluación lineal antes de exponer material 
 
 ### H. Blindaje del sistema operativo y memoria
 - **Process Hardening:** `libc::prctl` deshabilita volcados (`PR_SET_DUMPABLE = 0`), restringe ptrace y fija `RLIMIT_CORE = 0`.
-- **Boot Shield:** cifra plantillas críticas en reposo con ChaCha20Poly1305, las monta en RAM aislada y destruye trazas mediante ganchos de initramfs.
+- **Boot Shield:** cifra plantillas críticas en reposo con ChaCha20Poly1305, las monta en RAM aislada y destruye trazas mediante ganchos de initramfs. Admite **credencial única o doble** (matriz de 5 cajas + frase maestra, con segunda credencial opcional), **clave de coacción** (destruye el vault) y **modo espejismo** (plantillas señuelo ante manipulación).
 - **Seccomp y sandbox de firma:** la firma puede ejecutarse en un proceso hijo aislado por *namespaces* (sin red); filtros seccomp del sistema.
 - **Monitor heurístico (`ai_monitor`):** puntúa syscalls anómalas (inyección, montajes corruptos, depuradores) y puede disparar el aislamiento del llavero.
 
